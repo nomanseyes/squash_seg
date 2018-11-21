@@ -521,6 +521,44 @@ def get_reg_qsl(data=None, labels=None, qsl_type=None):
     
     return msk
 
+def make_null_box(data=None, null_num=None, box_size=None):
+    if data==None:
+        print('must supply datacube')
+        
+    if null_num==None: null_num=0
+    if box_size==None: box_size=2
+    if ((box_size%2)>0):
+        box_size+=1
+        print('box must be of even size -- increasing by one')
+
+    crr = data['crr'][0,0,:]
+    cth = data['cth'][0,:,0]
+    cph = data['cph'][:,0,0]
+    nrr = crr.size
+    nth = cth.size
+    nph = cph.size
+
+    null_locs=data['null_locs'].T
+    
+    rr_ind = np.argmax(crr > null_locs[null_num,2]*696)
+    th_ind = np.argmax(cth > null_locs[null_num,1])
+    ph_ind = np.argmax(cph > null_locs[null_num,0])
+
+    nll_indices=[]
+
+    hwidth = int(box_size/2)
+    
+    for i in range(-hwidth,hwidth):
+        if (0 <= ph_ind+i < nph):
+            for j in range(-hwidth,hwidth):
+                if (0 <= th_ind+j < nth):
+                    for k in range(-hwidth,hwidth):
+                        if (0 <= rr_ind+k < nrr):
+                            nll_indices.append((ph_ind+i, th_ind+j, rr_ind+k))
+
+    return nll_indices
+
+
 def get_adj_nll(data=None, labels=None, qsl_type=None, msk=None):
     if data==None:
         print('must supply seg data')
@@ -543,27 +581,45 @@ def get_adj_nll(data=None, labels=None, qsl_type=None, msk=None):
     N_null=null_locs.shape[0]
 
     # find overlap
-    crr = data['crr'][0,0,:]
-    cth = data['cth'][0,:,0]
-    cph = data['cph'][:,0,0]
     adj_nll_list=[]
     for n in range(N_null):
-        #get 2x2x2 cube surrounding location
-        rr_ind = np.argmax(crr > null_locs[n,2]*696)
-        th_ind = np.argmax(cth > null_locs[n,1])
-        ph_ind = np.argmax(cph > null_locs[n,0])
-        nll_indices=[]
-        for i in (-1,0):
-            for j in (-1,0):
-                for k in (-1,0):
-                    ind = (ph_ind+i, th_ind+j, rr_ind+k)
-                    if -1 not in ind: nll_indices.append(ind)
+        nll_box = make_null_box(data=data, null_num=n, box_size=2)
                     
-        if np.sum(qsl_msk[ind[0], ind[1], ind[2]]) > 0:
+        if np.sum(qsl_msk[coords] for coords in nll_box) > 0:
             adj_nll_list.append(n)
 
     return adj_nll_list
 
+
+
+
+
+def get_nll_regs(data=None, null_list=None, msk=None):
+    if data==None:
+        print('must supply seg data')
+
+    if null_list==None:
+        print('must supply null indices')
+
+    if 'null_locs' not in data.keys():
+        print('data must contain null locations')
+
+    if 'adj_msk' not in data.keys():
+        adj_msk = squash_seg.determin_adjacency(data=data)
+    else:
+        adj_msk = data['adj_msk']
+
+    labels=data['labels']
+    null_regs = []
+    for i in range(labels.size):
+        for j in null_list:
+            jbox=make_null_box(data=data, null_num=j, box_size=2)
+            jmsk = adj_msk[...,i]
+            if np.sum([jmsk[coords] for coords in jbox]) > 0:
+                if labels[i] not in null_regs:
+                    null_regs.append(labels[i])
+            
+    return null_regs
         
     
 
