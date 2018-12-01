@@ -628,6 +628,10 @@ def get_groups(data=None):
     data['nonempty_pairs'] = nonempty_pairs
     data['nonempty_trips'] = nonempty_trips
 
+    ### note that this can be sped up -- there are two many calls to get_reg_qsl for domains that are known to be empty
+    ### to improve, should check presense of nonempty elements in lower set orders.
+    ### ideally this would all be extensible to arbitrary levels with a leaf/branch heirarchy
+
     return data
                 
                 
