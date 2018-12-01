@@ -241,7 +241,7 @@ def build_qsl_msk(data=None, nr=None, nz_out=None, ny_out=None, nx_out=None, xmi
     # here we start our feature detection
     #######################################
 
-    if nrm_thrsh==None: nrm_thrsh=2
+    if nrm_thrsh==None: nrm_thrsh=4.5
     slog10q = data['slog10q']
         
     ### get the derivs.
@@ -254,23 +254,27 @@ def build_qsl_msk(data=None, nr=None, nz_out=None, ny_out=None, nx_out=None, xmi
     del dslq_dth
     gdn_slq_rr = dslq_drr * data['crr']
     del dslq_drr
-    abs_sqp = 10.**np.clip(np.absolute(slog10q.astype('float64')), np.log10(2), 10)
+    absQp = 10.**np.clip(np.absolute(slog10q), np.log10(2), 10)
     
-    # ### construct sobelov Q magnitude
-    log10_sbn = np.log10(np.sqrt(gdn_slq_ph**2 + gdn_slq_th**2 + gdn_slq_rr**2 + abs_sqp))
+    # ### construct grad Q magnitude
+    GlnQp = np.sqrt(gdn_slq_ph**2 + gdn_slq_th**2 + gdn_slq_rr**2)
     #del gdn_slq_ph, gdn_slq_th, gdn_slq_rr, abs_sqp
-    print('Sobelov norm density constructed \n%%%%%%%%%%%%%%%%%%%%%%%%%%%%')
+    print('Gradient norm constructed \n%%%%%%%%%%%%%%%%%%%%%%%%%%%%')
 
     
     ### create mask where norm greater than thresh
-    qsl_msk = log10_sbn > nrm_thrsh
+    ### empirically it seems that GlnQp goes as r^(-1/2) in the volume, so we'll incorporate this into the mask.
+    
+    SBN_val = absQp + (data['crr'] / data['crr'].min()) * GlnQp**2 ## sets threshold at outer radius and then scales inward.
+    qsl_msk = np.log10(SBN_val) > nrm_thrsh    
+    
     print('Threshold / edge mask built \n%%%%%%%%%%%%%%%%%%%%%%%%%%%%')
     ### filter using opening closing / object/hole removal
     qsl_msk = mor.closing(qsl_msk)
     print('Mask holes removed \n%%%%%%%%%%%%%%%%%%%%%%%%%%%%')
 
     data['qsl_msk'] = qsl_msk
-    data['log10_sbn'] = log10_sbn.astype('float32')
+    data['GlnQp'] = np.clip(GlnQp, 0, 10**10).astype('float32')
     
     return data
 
@@ -281,7 +285,7 @@ def build_qsl_msk(data=None, nr=None, nz_out=None, ny_out=None, nx_out=None, xmi
 
 
 
-def segment_volume(data=None, nr=None, nz_out=None, ny_out=None, nx_out=None, xmin=None, xmax=None, ymin=None, ymax=None, zmin=None, zmax=None, z_samp=None, solrad=None, q_dir=None, b_dir=None, glbl_mdl=None, ss_eof=None, nrm_thrsh=None, pad_thresh=None, bot_rad=None):
+def segment_volume(data=None, nr=None, nz_out=None, ny_out=None, nx_out=None, xmin=None, xmax=None, ymin=None, ymax=None, zmin=None, zmax=None, z_samp=None, solrad=None, q_dir=None, b_dir=None, glbl_mdl=None, ss_eof=None, nrm_thrsh=None, pad_ratio=None, bot_rad=None):
     
     if (data==None or ('qsl_msk' not in data.keys() ) ):
         data=build_qsl_msk(data=data, nr=nr, nz_out=nz_out, ny_out=ny_out, nx_out=nx_out, xmin=xmin, xmax=xmax, ymin=ymin, ymax=ymax, zmin=zmin, zmax=zmax, z_samp=z_samp, solrad=solrad, q_dir=q_dir, b_dir=b_dir, glbl_mdl=glbl_mdl, ss_eof=ss_eof, nrm_thrsh=nrm_thrsh)
@@ -299,7 +303,6 @@ def segment_volume(data=None, nr=None, nz_out=None, ny_out=None, nx_out=None, xm
     qsl_msk = data['qsl_msk']
 
     nph, nth, nrr = qsl_msk.shape
-    phi_bound_thresh=0.5
     
     q_segment = np.zeros(slog10q.shape, dtype='int32')### initiate segmentation label array.
     # it's useful to have masks for open and closed flux. We consider undecided flux to be open.
@@ -310,34 +313,34 @@ def segment_volume(data=None, nr=None, nz_out=None, ny_out=None, nx_out=None, xm
 
     print('Calculating distance transforms \n%%%%%%%%%%%%%%%%%%%%%%%%%')
 
-    met_ph, met_th, met_rr = get_differentials(data=data)
-    met_hyp = np.sqrt(met_ph**2 + met_th**2 + met_rr**2) # hypotenuse of local grid volume
-    met_vol = met_ph * met_th * met_rr
-    met_area_phbnd = met_rr[0,...]*met_th[0,...]
-    del met_ph, met_th, met_rr
     # it's also useful to have the distance from the interior of the qsl regions to their boundary, and the other way.
-    #    qsl_dist = ndi.distance_transform_edt(~qsl_msk).astype('int16') # dist to nearest qsl
-    #    reg_dist = ndi.distance_transform_edt( qsl_msk).astype('int16') # dist to nearest reg
-    qsl_dist = ndi.distance_transform_edt(~qsl_msk).astype('int16') * met_hyp # dist to nearest qsl in Mm (assuming diagonals)
-    reg_dist = ndi.distance_transform_edt( qsl_msk).astype('int16') * met_hyp # dist to nearest reg in Mm (assuming diagonals)
-    qsl_halfwidth = np.mean(reg_dist[np.nonzero( qsl_msk)]) # typical qsl distance to region
-    rad_qhw = qsl_halfwidth * data['crr'] / data['crr'].mean() # qsl_halfwidth scaled by local coordinate radius
-    reg_halfwidth = np.mean(qsl_dist[np.nonzero(~qsl_msk)]) # typical reg distance to qsl
+    qsl_dist = ndi.distance_transform_edt(~qsl_msk).astype('float32') # distance to nearest qsl
+    reg_width = np.mean(qsl_dist[np.nonzero(~qsl_msk)])*4 # full width is 4 times average distance to boundary
+    print('Vol width: ',reg_width)
+    reg_dist = ndi.distance_transform_edt( qsl_msk).astype('float32') # distance to nearest low q region
+    qsl_width = np.mean(reg_dist[np.nonzero( qsl_msk)])*4 # full width is 4 times average distance to boundary
+    print('HQV width: ',qsl_width)
 
+    
     print('Performing discrete flux labeling \n%%%%%%%%%%%%%%%%%%%%%%%%%')
 
-    if pad_thresh==None: pad_thresh=1
+    if pad_ratio==None: pad_ratio=0.25 # default is pad out to a typical quarter-width.
     
     # now we'll label the open flux domains, above min height.
-    # qsl_dist is in physical units -- we want to padding size to increase with radius and compare to threshold * qsl_halfwidth
-    q_segment -= skim.label((qsl_dist > pad_thresh * rad_qhw) & (slog10q < 0) & (data['crr'] >= bot_rad*solrad)) # all pixels not within or adjacent to a qsl
+    # we'll pad the qsl mask by a distance proportionate to the qsl_halfwidth, including a radial scaling to accomodate thicker hqvs at larger radii
+    pad_msk = ( qsl_dist > pad_ratio * qsl_width * (data['crr'] / data['crr'].mean()) ) # empirical radial dependence...
+    q_segment -= skim.label(pad_msk & (slog10q < 0) & (data['crr'] >= bot_rad*solrad)) # all pixels not within or adjacent to a qsl
     open_labels = np.unique(q_segment[np.nonzero(q_segment < 0)])
     # and we'll get the closed flux labels in the same way, also above min height.
-    q_segment += skim.label((qsl_dist > pad_thresh * rad_qhw) & (slog10q > 0) & (data['crr'] >= bot_rad*solrad)) # all pixels not within or adjacent to a qsl
+    q_segment += skim.label(pad_msk & (slog10q > 0) & (data['crr'] >= bot_rad*solrad)) # all pixels not within or adjacent to a qsl
     clsd_labels = np.unique(q_segment[np.nonzero(q_segment > 0)])
+    data['pad_msk'] = pad_msk
+    del slog10q, pad_msk
 
     print('Associating domains across ph=0 boundary \n%%%%%%%%%%%%%%%%%%%%%%%%%')
 
+    phi_bound_thresh=0.5
+    
     # now we'll associate regions across the phi boundary
     # need the labels on the boundary
     phb_seg = np.roll(q_segment, 1, axis=0)[0:2,...] # this is just the 0,-1 columns stacked together
@@ -365,12 +368,14 @@ def segment_volume(data=None, nr=None, nz_out=None, ny_out=None, nx_out=None, xm
             if ((ri != rj) & (ri*rj > 0) & (iopos==jopos)): # only consider same type flux -- skip redundant names.
                 mi = ((phb_seg[0,...]==ri) & (qsl_msk[0,...]==0))
                 mj = ((phb_seg[1,...]==rj) & (qsl_msk[1,...]==0))
-                i_area = np.sum( mi*met_area_phbnd ) 
-                j_area = np.sum( mj*met_area_phbnd )
-                c_area = np.sum( (mi & mj)*met_area_phbnd )
-                min_area = np.max( (np.pi * qsl_halfwidth**2, phi_bound_thresh * np.min( (i_area, j_area) )) ) # fraction of smallest of individual areas, iff larger than qsl-cross-section
-                if (c_area > min_area):
-                    swap[i,j]=True
+                i_area = np.sum( mi ) 
+                j_area = np.sum( mj )
+                c_area = np.sum( (mi & mj) )
+                if (c_area > 0):
+                    # compare c_area to min allowable: composed of the larger of ( local weighted qsl cross section , smaller of ( fraction of local individual areas))
+                    qsl_local_area_ave = np.sum( ( np.pi * (0.5*qsl_width)**2 * data['crr'][0,...]**2 / data['crr'].mean()**2 ) * (mi & mj) ) / c_area
+                    if c_area > np.max(( qsl_local_area_ave, phi_bound_thresh * np.min(( i_area, j_area )) )):        
+                        swap[i,j]=True
 
     # now the actual swapping
     swap = swap | swap.T     # first we consolidate the swap map to the minor diagonal
@@ -387,25 +392,27 @@ def segment_volume(data=None, nr=None, nz_out=None, ny_out=None, nx_out=None, xm
 
     print('Removing domains with sub-minimum volume \n%%%%%%%%%%%%%%%%%%%%%%%%%')
 
-    # this should really allow for smaller domains in the closed field regions.
-    local_dens_thrsh = 1 / ((rad_qhw**3 / met_vol) * (data['crr']/data['crr'].min())**2)
     for reg in np.unique(q_segment[np.nonzero(q_segment)]):
         tmp_msk = (q_segment == reg)
         #print('region: '+str(reg)+', volume: '+str(np.sum(tmp_msk)))
-        if np.sum(tmp_msk * local_dens_thrsh) < 1: # threshold size for valid regions -- threshold increases quadratically with height to allow smaller closed domains
+        if np.sum(tmp_msk * data['crr'].mean()**2 / data['crr']**2) < (0.5*qsl_width)**3: # threshold size for valid regions -- threshold increases quadratically with height to allow smaller closed domains
             q_segment = q_segment * ~tmp_msk  # zero in mask, unchanged else.
-
+    del tmp_msk
+    
     print('Performing watershed backfill into HQV padding \n%%%%%%%%%%%%%%%%%%%%%%%%%')
 
-    log10_sbn = data['log10_sbn']
+    absQp = np.clip(np.absolute(data['slog10q']), np.log10(2), 10)
+    log10_SNQ =  np.log10(absQp + (data['crr'] / data['crr'].max()) * data['GlnQp']**2)
+    del absQp
+    
     # Initial watershed phase
     # First we grow regions into the padding layer outside the hqv mask
     stime = time.time()
-    q_segment += mor.watershed(           log10_sbn, q_segment * opn_msk, mask=(opn_msk & ~qsl_msk), watershed_line=False) * ((q_segment==0) & opn_msk & ~qsl_msk)
+    q_segment += mor.watershed(           log10_SNQ, q_segment * opn_msk, mask=(opn_msk & ~qsl_msk), watershed_line=False) * ((q_segment==0) & opn_msk & ~qsl_msk)
     print('Open flux backfill completed in '+str(int(time.time()-stime))+' seconds')
     stime = time.time()
-    q_segment += mor.watershed(           log10_sbn, q_segment * cls_msk, mask=(cls_msk & ~qsl_msk), watershed_line=False) * ((q_segment==0) & cls_msk & ~qsl_msk)
-    print('Clsd flux backfill completed in '+str(int(time.time()-stime))+' seconds \n%%%%%%%%%%%%%%%%%%%%%%')
+    q_segment += mor.watershed(           log10_SNQ, q_segment * cls_msk, mask=(cls_msk & ~qsl_msk), watershed_line=False) * ((q_segment==0) & cls_msk & ~qsl_msk)
+    print('Clsd flux backfill completed in '+str(int(time.time()-stime))+' seconds \n%%%%%%%%%%%%%%%%%%%%%%%%%')
     
     
     print('Enforcing boundary connectivity \n%%%%%%%%%%%%%%%%%%%%%%%%%')
@@ -420,20 +427,19 @@ def segment_volume(data=None, nr=None, nz_out=None, ny_out=None, nx_out=None, xm
         tmp_msk = (q_segment == reg)
         if np.sum(tmp_msk[...,0]) == 0: # closed domains must intersection the bottom boundary.
             q_segment = q_segment * ~tmp_msk # zero in mask, unchanged else.
-
-
+    del tmp_msk
 
 
     
-    print('Performing restricted watershed backfill into HQV volume \n%%%%%%%%%%%%%%%%%%%%%%%%%')
+    print('Performing restricted watershed backfill into HQV mask \n%%%%%%%%%%%%%%%%%%%%%%%%%')
 
     # Second, we grow regions using the same-type mask, which just expands open-open, close-close.
     stime = time.time()
-    q_segment += mor.watershed(           log10_sbn, q_segment * opn_msk, mask=opn_msk, watershed_line=False) * ((q_segment==0) & opn_msk)
+    q_segment += mor.watershed(           log10_SNQ, q_segment * opn_msk, mask=opn_msk, watershed_line=False) * ((q_segment==0) & opn_msk)
     print('Open flux backfill completed in '+str(int(time.time()-stime))+' seconds')
     stime = time.time()
-    q_segment += mor.watershed(           log10_sbn, q_segment * cls_msk, mask=cls_msk, watershed_line=False) * ((q_segment==0) & cls_msk)
-    print('Clsd flux backfill completed in '+str(int(time.time()-stime))+' seconds \n%%%%%%%%%%%%%%%%%%%%%%')
+    q_segment += mor.watershed(           log10_SNQ, q_segment * cls_msk, mask=cls_msk, watershed_line=False) * ((q_segment==0) & cls_msk)
+    print('Clsd flux backfill completed in '+str(int(time.time()-stime))+' seconds \n%%%%%%%%%%%%%%%%%%%%%%%%%')
 
 
     
@@ -441,10 +447,10 @@ def segment_volume(data=None, nr=None, nz_out=None, ny_out=None, nx_out=None, xm
 
     # Third, we grow regions through opposite type, but only within a qsl, where type mixing is expected.
     stime = time.time()
-    q_segment += mor.watershed(           log10_sbn, q_segment * opn_msk, mask=qsl_msk, watershed_line=False) * ((q_segment==0) & opn_msk)
+    q_segment += mor.watershed(           log10_SNQ, q_segment * opn_msk, mask=qsl_msk, watershed_line=False) * ((q_segment==0) & opn_msk)
     print('Open flux backfill completed in '+str(int(time.time()-stime))+' seconds')
     stime = time.time()
-    q_segment += mor.watershed(           log10_sbn, q_segment * cls_msk, mask=qsl_msk, watershed_line=False) * ((q_segment==0) & cls_msk)
+    q_segment += mor.watershed(           log10_SNQ, q_segment * cls_msk, mask=qsl_msk, watershed_line=False) * ((q_segment==0) & cls_msk)
     print('Clsd flux backfill completed in '+str(int(time.time()-stime))+' seconds')
 
 
@@ -452,7 +458,7 @@ def segment_volume(data=None, nr=None, nz_out=None, ny_out=None, nx_out=None, xm
     print('Performing watershed backfill into residual domains \n%%%%%%%%%%%%%%%%%%%%%%%%%')
     # Finally, we grow null regions with no preference, allowing open and closed to compete.
     stime = time.time()
-    q_segment += mor.watershed(         reg_dist**2, q_segment,                         watershed_line=False) * ((q_segment==0))
+    q_segment += mor.watershed(           1/(1 + qsl_dist), q_segment,                         watershed_line=False) * ((q_segment==0))
     print('Final flux backfill completed in '+str(int(time.time()-stime))+' seconds \n%%%%%%%%%%%%%%%%%%%%%%%%%')
     # There may still be unnasigned regions. But these will be outliers buried deep within opposite flux types.
 
@@ -462,12 +468,24 @@ def segment_volume(data=None, nr=None, nz_out=None, ny_out=None, nx_out=None, xm
     # now let's relabel with integer labels removing gaps
     open_labels = -np.unique(-q_segment[np.nonzero(q_segment < 0)]) # negative gets it in reverse order
     clsd_labels = np.unique(q_segment[np.nonzero(q_segment > 0)])
-    # BECAUSE the labels increase monotonically, they are guaranteed to increase faster than the index labeling
-    # this is why we can get away with renaming on the fly. Because the new name is always earlier in the list than the old name.
-    for i in range(0, open_labels.size):
-        q_segment = -(i + 1)*(q_segment == open_labels[i]) + q_segment*(q_segment != open_labels[i])
-    for i in range(0, clsd_labels.size):
-        q_segment = +(i + 1)*(q_segment == clsd_labels[i]) + q_segment*(q_segment != clsd_labels[i])
+    # we want this to be a random reordering so we have to keep track of swapped regions to avoid multiple swaps.
+    open_relabel = np.arange(0, open_labels.size)
+    clsd_relabel = np.arange(0, clsd_labels.size)
+    np.random.seed(open_relabel.size) # repeatable random seed
+    np.random.shuffle(open_relabel) # random shuffle of domain order
+    np.random.seed(clsd_relabel.size) # repeatable random seed
+    np.random.shuffle(clsd_relabel) # random shuffle of domain order
+
+    swapped = (q_segment != q_segment) # boolean to track already swapped domains
+    for i in range(open_relabel.size):
+        swap_msk = ((q_segment == open_labels[i]) & ~swapped)
+        q_segment = q_segment * (~swap_msk) - (open_relabel[i]+1) * (swap_msk)
+        swapped = swapped | swap_msk
+    for i in range(clsd_relabel.size):
+        swap_msk = ((q_segment == clsd_labels[i]) & ~swapped)
+        q_segment = q_segment * (~swap_msk) + (clsd_relabel[i]+1) * (swap_msk)
+        swapped = swapped | swap_msk
+    del swapped, swap_msk, open_relabel, clsd_relabel
         
     open_labels = np.unique(q_segment[np.nonzero(q_segment < 0)])
     clsd_labels = np.unique(q_segment[np.nonzero(q_segment > 0)])
@@ -494,16 +512,17 @@ def segment_volume(data=None, nr=None, nz_out=None, ny_out=None, nx_out=None, xm
     data['clsd_labels']   = clsd_labels
     data['labels']        = labels
     data['opnflxpos']     = opnflxpos
-    data['qsl_halfwidth'] = qsl_halfwidth
+    data['qsl_width'] = qsl_width
+    data['reg_width'] = reg_width
     
     return data
 
-def determine_adjacency(data=None, nr=None, nz_out=None, ny_out=None, nx_out=None, xmin=None, xmax=None, ymin=None, ymax=None, zmin=None, zmax=None, z_samp=None, solrad=None, q_dir=None, b_dir=None, glbl_mdl=None, ss_eof=None, nrm_thrsh=None, pad_thresh=None, bot_rad=None, adj_thresh=None):
+def determine_adjacency(data=None, nr=None, nz_out=None, ny_out=None, nx_out=None, xmin=None, xmax=None, ymin=None, ymax=None, zmin=None, zmax=None, z_samp=None, solrad=None, q_dir=None, b_dir=None, glbl_mdl=None, ss_eof=None, nrm_thrsh=None, pad_ratio=None, bot_rad=None, adj_thresh=None):
 
-    if adj_thresh==None: adj_thresh=4
+    if adj_thresh==None: adj_thresh=0.5
 
     if (data==None or ('q_segment' not in data.keys() ) ):
-        data=segment_volume(data=data, nr=nr, nz_out=nz_out, ny_out=ny_out, nx_out=nx_out, xmin=xmin, xmax=xmax, ymin=ymin, ymax=ymax, zmin=zmin, zmax=zmax, z_samp=z_samp, solrad=solrad, q_dir=q_dir, b_dir=b_dir, glbl_mdl=glbl_mdl, ss_eof=ss_eof, nrm_thrsh=nrm_thrsh, pad_thresh=pad_thresh, bot_rad=bot_rad)
+        data=segment_volume(data=data, nr=nr, nz_out=nz_out, ny_out=ny_out, nx_out=nx_out, xmin=xmin, xmax=xmax, ymin=ymin, ymax=ymax, zmin=zmin, zmax=zmax, z_samp=z_samp, solrad=solrad, q_dir=q_dir, b_dir=b_dir, glbl_mdl=glbl_mdl, ss_eof=ss_eof, nrm_thrsh=nrm_thrsh, pad_ratio=pad_ratio, bot_rad=bot_rad)
 
     # let's get a mask set up with all of the regions along an axis.
     # It will be a boolean of whether any given pixel is
@@ -516,22 +535,19 @@ def determine_adjacency(data=None, nr=None, nz_out=None, ny_out=None, nx_out=Non
     adj_msk = np.zeros((nx, ny, nz, nregs)).astype('bool')
 
     # here we calculate distance transforms
-    met_ph, met_th, met_rr = get_differentials(data=data)
-    met_hyp = np.sqrt(met_ph**2 + met_th**2 + met_rr**2)
-    qsl_halfwidth = data['qsl_halfwidth']
-    del met_ph, met_th, met_rr
+    qsl_width = data['qsl_width']
     for i in np.arange(nregs):
         print('Finding distance to region '+str(regs[i]))
-        dist_i = (ndi.distance_transform_edt( q_segment!=regs[i] ) * met_hyp).astype('float16')
+        dist_i = ndi.distance_transform_edt( q_segment!=regs[i] ).astype('float32')
         print('Determining proximity mask') # and compare to the threshold to create a mask.
-        adj_msk[...,i] = dist_i <= qsl_halfwidth * adj_thresh
+        adj_msk[...,i] = dist_i * data['crr'].mean() <= qsl_width * data['crr'] * adj_thresh
         #reg_adj_ind[str(regs[i])] = np.nonzero(adj_msk[...,i])
 
     data['adj_msk']=adj_msk
 
     return data
-
-
+        
+    
 
 def get_reg_qsl(data=None, reg_labels=None, logic=None):
     if data==None:
@@ -562,6 +578,62 @@ def get_reg_qsl(data=None, reg_labels=None, logic=None):
     msk = msk & data['qsl_msk'] # project against qsl mask
     
     return msk
+
+def get_groups(data=None):
+
+    nonempty_pairs = []
+    # first we append pairwise groupings
+    for l1 in data['open_labels']:
+        for l2 in data['open_labels'][np.nonzero(data['open_labels']>l1)]:
+            hqv = get_reg_qsl(data=data, reg_labels=(l1, l2), logic='Intrs')
+            top = (np.sum(hqv[...,-1]) > 0)
+            vol = np.sum(hqv)
+            if vol > 0:
+                print('overlap found for pair (',l1,',',l2,', vol: ',vol,', top: ',top,')')
+                nonempty_pairs.append(((l1, l2), vol, top))
+    # now we explore depth -- triple groups
+    nonempty_trips = []
+    for i in range(len(nonempty_pairs)):
+        l1, l2 = nonempty_pairs[i][0]
+        for j in data['open_labels'][np.nonzero(data['open_labels'] > l2)]:
+            hqv = get_reg_qsl(data=data, reg_labels=(l1, l2, j), logic='Intrs')
+            top = (np.sum(hqv[...,-1]) > 0)
+            vol = np.sum(hqv)
+            if vol > 0:
+                print('overlap found for pair (',l1,',',l2,',',j,', vol: ',vol,', top: ',top,')')
+                nonempty_trips.append(((l1, l2, j), vol, top))
+    # now quadruple groups
+    nonempty_quads = []
+    for i in range(len(nonempty_trips)):
+        l1, l2, l3 = nonempty_trips[i][0]
+        for j in data['open_labels'][np.nonzero(data['open_labels'] > l3)]:
+            hqv = get_reg_qsl(data=data, reg_labels=(l1, l2, l3, j), logic='Intrs')
+            top = (np.sum(hqv[...,-1]) > 0)
+            vol = np.sum(hqv)
+            if vol > 0:
+                print('overlap found for pair (',l1,',',l2,',',l3,',',j,', vol: ',vol,', top: ',top,')')
+                nonempty_quads.append(((l1, l2, l3, j), vol, top))
+    # now quadruple quints
+    nonempty_quints = []
+    for i in range(len(nonempty_quads)):
+        l1, l2, l3, l4 = nonempty_quads[i][0]
+        for j in data['open_labels'][np.nonzero(data['open_labels'] > l4)]:
+            hqv = get_reg_qsl(data=data, reg_labels=(l1, l2, l3, l4, j), logic='Intrs')
+            top = (np.sum(hqv[...,-1]) > 0)
+            vol = np.sum(hqv)
+            if vol > 0:
+                print('overlap found for pair (',l1,',',l2,',',l3,',',l4,',',j,', vol: ',vol,', top: ',top,')')
+                nonempty_quads.append(((l1, l2, l3, l4, j), vol, top))
+
+    data['nonempty_pairs'] = nonempty_pairs
+    data['nonempty_trips'] = nonempty_trips
+
+    return data
+                
+                
+            
+        
+        
 
 def make_null_box(data=None, null_num=None, box_size=None):
     if data==None:
@@ -729,16 +801,20 @@ def get_nll_regs(data=None, null_list=None, msk=None):
 
     
 
-def make_cmap(data=None):
+def make_cmap(data=None, shuffle_colors=None):
     if data==None:
         print('must supply seg data')
 
     # define a custom color for segmentation visualization
     labels = np.unique(data['q_segment'])
-    openlin = np.linspace(0, 1, np.size(labels[np.argwhere(labels < 0)]) + 1)
-    clsdlin = np.linspace(0, 1, np.size(labels[np.argwhere(labels > 0)]) + 1)
-    opencolors = plt.cm.winter(openlin[1:])
-    clsdcolors = plt.cm.autumn(clsdlin[1:])
+    openlin = np.linspace(0, 1, np.size(labels[np.argwhere(labels < 0)]) + 1)[1:]
+    clsdlin = np.linspace(0, 1, np.size(labels[np.argwhere(labels > 0)]) + 1)[1:]
+    if shuffle_colors==True:
+        from random import shuffle
+        shuffle(openlin)
+        shuffle(clsdlin)
+    opencolors = plt.cm.winter(openlin)
+    clsdcolors = plt.cm.autumn(clsdlin)
     whitecolor = plt.cm.binary(0)
     blackcolor = plt.cm.binary(255)
     mycolors = np.vstack((np.flip(opencolors, axis=0),blackcolor,clsdcolors))
@@ -753,13 +829,13 @@ def load_data(fname=None):
 
     return data
 
-def save_data(fname=None, seg_data=None):
+def save_data(fname=None, data=None):
     if (fname==None):
         print('Writing to default filename: seg_data.npz')
         fname='seg_data.npz'
-    if (seg_data==None):
+    if (data==None):
         print('Error: must supply dictionary to be saved')
-    else: np.savez(fname, **seg_data)
+    else: np.savez(fname, **data)
     return
     
 def export_vtk(data=None, odir=None, ofname=None, rr_rng=None, th_rng=None, ph_rng=None):
@@ -929,7 +1005,7 @@ def visualize(data=None, rr=None, th=None, ph=None, data_key=None, mask_key=None
         ctable ='viridis'
         vrange = (-3,3)
     if data_key=='q_segment':
-        ctable = make_cmap(data)
+        ctable = make_cmap(dada=data)
         vrange = (data[data_key].min(), data[data_key].max())
     if data_key=='brr':
         ctable = 'bwr_r'
@@ -1022,7 +1098,7 @@ def visualize(data=None, rr=None, th=None, ph=None, data_key=None, mask_key=None
             ctable='viridis'
             vrange = (-3,3)
         if data_key=='q_segment':
-            ctable = make_cmap(data)
+            ctable = make_cmap(data=data)
             vrange = (data[data_key].min(), data[data_key].max())
         if data_key=='brr':
             ctable = 'bwr_r'
