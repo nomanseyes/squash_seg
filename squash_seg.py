@@ -581,52 +581,54 @@ def get_reg_qsl(data=None, reg_labels=None, logic=None):
 
 def get_groups(data=None):
 
-    nonempty_pairs = []
+    group_dict_list = []
+    group_branch_list = []
     # first we append pairwise groupings
     for l1 in data['open_labels']:
         for l2 in data['open_labels'][np.nonzero(data['open_labels']>l1)]:
-            hqv = get_reg_qsl(data=data, reg_labels=(l1, l2), logic='Intrs')
+            labels = [l1,l2]
+            hqv = get_reg_qsl(data=data, reg_labels=labels, logic='Intrs')
             top = (np.sum(hqv[...,-1]) > 0)
             vol = np.sum(hqv)
             if vol > 0:
-                print('overlap found for pair (',l1,',',l2,', vol: ',vol,', top: ',top,')')
-                nonempty_pairs.append(((l1, l2), vol, top))
+                print('overlap found for labels (',labels,', vol: ',vol,', top: ',top,')')
+                group_dict_list.append({'labels':labels, 'vol':vol, 'top':top})
+                group_branch_list.append(True)
     # now we explore depth -- triple groups
-    nonempty_trips = []
-    for i in range(len(nonempty_pairs)):
-        l1, l2 = nonempty_pairs[i][0]
-        for j in data['open_labels'][np.nonzero(data['open_labels'] > l2)]:
-            hqv = get_reg_qsl(data=data, reg_labels=(l1, l2, j), logic='Intrs')
-            top = (np.sum(hqv[...,-1]) > 0)
-            vol = np.sum(hqv)
-            if vol > 0:
-                print('overlap found for pair (',l1,',',l2,',',j,', vol: ',vol,', top: ',top,')')
-                nonempty_trips.append(((l1, l2, j), vol, top))
-    # now quadruple groups
-    nonempty_quads = []
-    for i in range(len(nonempty_trips)):
-        l1, l2, l3 = nonempty_trips[i][0]
-        for j in data['open_labels'][np.nonzero(data['open_labels'] > l3)]:
-            hqv = get_reg_qsl(data=data, reg_labels=(l1, l2, l3, j), logic='Intrs')
-            top = (np.sum(hqv[...,-1]) > 0)
-            vol = np.sum(hqv)
-            if vol > 0:
-                print('overlap found for pair (',l1,',',l2,',',l3,',',j,', vol: ',vol,', top: ',top,')')
-                nonempty_quads.append(((l1, l2, l3, j), vol, top))
-    # now quadruple quints
-    nonempty_quints = []
-    for i in range(len(nonempty_quads)):
-        l1, l2, l3, l4 = nonempty_quads[i][0]
-        for j in data['open_labels'][np.nonzero(data['open_labels'] > l4)]:
-            hqv = get_reg_qsl(data=data, reg_labels=(l1, l2, l3, l4, j), logic='Intrs')
-            top = (np.sum(hqv[...,-1]) > 0)
-            vol = np.sum(hqv)
-            if vol > 0:
-                print('overlap found for pair (',l1,',',l2,',',l3,',',l4,',',j,', vol: ',vol,', top: ',top,')')
-                nonempty_quads.append(((l1, l2, l3, l4, j), vol, top))
 
-    data['nonempty_pairs'] = nonempty_pairs
-    data['nonempty_trips'] = nonempty_trips
+    branch_count = 1 # initialize number of groups to be explored.
+    while branch_count > 0:
+        branch_count = 0
+        label_len_list = [len(grp['labels']) for grp in group_dict_list]
+        for i in range(len(group_dict_list)):
+            if group_branch_list[i] == True: # branches need to be explored
+                group_branch_list[i] = False # this branch has been explored after this cycle.
+                branch_labels = group_dict_list[i]['labels']
+                n_labels = len(branch_labels)
+                ss_same_len_list, = np.nonzero(np.array(label_len_list)==n_labels) # index of groups with same number of antries as current branch
+                for j in data['open_labels'][np.nonzero(data['open_labels'] > max(branch_labels))]: # next label to add to branch
+                    # first we make sure that j has nonempty overlaps with the elements of the group
+                    nonempty_count = 0
+                    for k in range(n_labels):
+                        test_labels = branch_labels.copy()
+                        test_labels[k] = j # this is the branch group with the new index swapped in for one of the elements
+                        test_labels = sorted(test_labels)
+                        for ss_same_len in ss_same_len_list: # index of groups with same number of antries as current branch
+                            if group_dict_list[ss_same_len]['labels'] == test_labels:
+                                nonempty_count+=1 # this swap works.
+                    # from above, there should be as many nonempties as entries (i.e. a&b&c iff a&b & a&c & b&c)
+                    if nonempty_count == n_labels: # require that every subgroup had a nonzero entry.        
+                        supergroup_labels = [l for k in [branch_labels, [j]] for l in k]
+                        hqv = get_reg_qsl(data=data, reg_labels=supergroup_labels, logic='Intrs')
+                        top = (np.sum(hqv[...,-1]) > 0)
+                        vol = np.sum(hqv)
+                        if vol > 0:
+                            print('overlap found for labels (',supergroup_labels,', vol: ',vol,', top: ',top,')')
+                            group_dict_list.append({'labels':supergroup_labels, 'vol':vol, 'top':top})
+                            group_branch_list.append(True)
+                            branch_count+=1
+
+    data['group_list'] = group_dict_list
 
     ### note that this can be sped up -- there are two many calls to get_reg_qsl for domains that are known to be empty
     ### to improve, should check presense of nonempty elements in lower set orders.
