@@ -161,7 +161,7 @@ def extract_bfield_data(data=None, nr=None, nz_out=None, ny_out=None, nx_out=Non
     nx = ph_mag.size
     ny = th_mag.size
     nz = rr_mag.size
-
+    
     #minus in b_theta is due to Griffiths' def
     b_ph_nat =   (np.array(pd.read_table(b_dir+'/bx0.dat',header=None))[...,0].reshape((nz,ny,nx)) ).transpose((2,1,0)).astype('float32')
     b_th_nat = - (np.array(pd.read_table(b_dir+'/by0.dat',header=None))[...,0].reshape((nz,ny,nx)) ).transpose((2,1,0)).astype('float32')
@@ -178,13 +178,14 @@ def extract_bfield_data(data=None, nr=None, nz_out=None, ny_out=None, nx_out=Non
     ###### global models exclude ph=360 from the source field but include it in the q output.
     ###### global models also exclude the poles. We reintroduce these, setting the pole equal to the ave.
     if glbl_mdl==True:
-        nx += 1
-        ph_mag = np.append(ph_mag, 360.)
+        if ph_mag.max() != 360:
+            nx += 1
+            ph_mag = np.append(ph_mag, 360.)
 
-        b_ph_nat = np.append(b_ph_nat, b_ph_nat[0,:,:].reshape(1,ny,nz), axis=0)
-        b_th_nat = np.append(b_th_nat, b_th_nat[0,:,:].reshape(1,ny,nz), axis=0)
-        b_rr_nat = np.append(b_rr_nat, b_rr_nat[0,:,:].reshape(1,ny,nz), axis=0)
-        ##### b_ph is now explicitly periodic and spans the entire domain.
+            b_ph_nat = np.append(b_ph_nat, b_ph_nat[0,:,:].reshape(1,ny,nz), axis=0)
+            b_th_nat = np.append(b_th_nat, b_th_nat[0,:,:].reshape(1,ny,nz), axis=0)
+            b_rr_nat = np.append(b_rr_nat, b_rr_nat[0,:,:].reshape(1,ny,nz), axis=0)
+            ##### b_ph is now explicitly periodic and spans the entire domain.
 
         ny += 2
         th_mag = np.append(np.append(-90, th_mag), 90)
@@ -198,7 +199,7 @@ def extract_bfield_data(data=None, nr=None, nz_out=None, ny_out=None, nx_out=Non
 
     b_coords = [ph_mag, th_mag, rr_mag]
     q_pts = np.stack(( data['cph'], data['cth'], data['crr'] )).reshape((3, data['cph'].size)).T
-
+    
     bph_interpolator = RGI(points=b_coords, values=b_ph_nat)
     bth_interpolator = RGI(points=b_coords, values=b_th_nat)
     brr_interpolator = RGI(points=b_coords, values=b_rr_nat)   
@@ -498,22 +499,22 @@ def segment_volume(data=None, nr=None, nz_out=None, ny_out=None, nx_out=None, xm
     seg_msk = ((seg_gx**2 + seg_gy**2 + seg_gz**2) == 0)
     del seg_gx, seg_gy, seg_gz
 
-    opnflxpos=(open_labels*0.).astype('float16') # measure of positivity
+    opos_labels=[]
     for i in np.arange(open_labels.size):
         ri = open_labels[i]
         n_pos = np.sum(data['brr'][...,-1][np.nonzero(q_segment[...,-1]==ri)]>0) # positive area
         n_neg = np.sum(data['brr'][...,-1][np.nonzero(q_segment[...,-1]==ri)]<0) # negative area
-        opnflxpos[i] = (n_pos - n_neg)/(n_pos + n_neg)
+        if ((n_pos - n_neg)/(n_pos + n_neg)) > 0: opos_labels.append(ri)
 
     data['q_segment']     = q_segment
     data['qsl_msk']       = qsl_msk
     data['seg_msk']       = seg_msk
     data['open_labels']   = open_labels
     data['clsd_labels']   = clsd_labels
+    data['opos_labels']   = opos_labels
     data['labels']        = labels
-    data['opnflxpos']     = opnflxpos
-    data['qsl_width'] = qsl_width
-    data['reg_width'] = reg_width
+    data['qsl_width']     = qsl_width
+    data['reg_width']     = reg_width
     
     return data
 
@@ -579,38 +580,53 @@ def get_reg_qsl(data=None, reg_labels=None, logic=None):
     
     return msk
 
-def get_groups(data=None):
+def get_groups(data=None, reg_labels=None, key_name=None):
 
+    if reg_labels==None: reg_labels = 'all'
+    if reg_labels=='all':
+        key_name='all_groups'
+        labels = data['labels']
+    if reg_labels=='open':
+        key_name='open_groups'
+        labels = data['open_labels']
+    if reg_labels=='clsd':
+        key_name='clsd_groups'
+        labels = data['clsd_labels']
+    if type(reg_labels)==list:
+        if key_name==None:
+            key_name='custom_group'
+        labels=reg_labels
+        
     group_dict_list = []
-    group_branch_list = []
+    
     # first we append pairwise groupings
-    for l1 in data['open_labels']:
-        for l2 in data['open_labels'][np.nonzero(data['open_labels']>l1)]:
-            labels = [l1,l2]
-            hqv = get_reg_qsl(data=data, reg_labels=labels, logic='Intrs')
+    for l1 in labels:
+        for l2 in labels[np.nonzero(labels>l1)]:
+            group_labels = [l1,l2]
+            hqv = get_reg_qsl(data=data, reg_labels=group_labels, logic='Intrs')
             top = (np.sum(hqv[...,-1]) > 0)
             vol = np.sum(hqv)
             if vol > 0:
-                print('overlap found for labels (',labels,', vol: ',vol,', top: ',top,')')
-                group_dict_list.append({'labels':labels, 'vol':vol, 'top':top})
-                group_branch_list.append(True)
+                iface_type = group_type(data=data, labels=group_labels)
+                print('overlap found for labels (',group_labels,', vol: ',vol,', top: ',top,', iface: ',iface_type,')')
+                group_dict_list.append({'labels':group_labels, 'vol':vol, 'tree':None, 'top':top, 'iface':iface_type})
     # now we explore depth -- triple groups
 
-    branch_count = 1 # initialize number of groups to be explored.
-    while branch_count > 0:
-        branch_count = 0
+    new_groups=True # initialize number of groups to be explored.
+    while new_groups==True:
+        new_groups = False
         label_len_list = [len(grp['labels']) for grp in group_dict_list]
         for i in range(len(group_dict_list)):
-            if group_branch_list[i] == True: # branches need to be explored
-                group_branch_list[i] = False # this branch has been explored after this cycle.
-                branch_labels = group_dict_list[i]['labels']
-                n_labels = len(branch_labels)
-                ss_same_len_list, = np.nonzero(np.array(label_len_list)==n_labels) # index of groups with same number of antries as current branch
-                for j in data['open_labels'][np.nonzero(data['open_labels'] > max(branch_labels))]: # next label to add to branch
+            if group_dict_list[i]['tree'] == None: # need to be explored
+                group_dict_list[i]['tree'] = 'leaf' # leaf unless supporting smaller leaves -- then branch.
+                subgroup_labels = group_dict_list[i]['labels']
+                n_labels = len(subgroup_labels)
+                ss_same_len_list, = np.nonzero(np.array(label_len_list)==n_labels) # index of groups with same number of antries as current group
+                for j in labels[np.nonzero(labels > max(subgroup_labels))]: # next label to add to group
                     # first we make sure that j has nonempty overlaps with the elements of the group
                     nonempty_count = 0
                     for k in range(n_labels):
-                        test_labels = branch_labels.copy()
+                        test_labels = subgroup_labels.copy()
                         test_labels[k] = j # this is the branch group with the new index swapped in for one of the elements
                         test_labels = sorted(test_labels)
                         for ss_same_len in ss_same_len_list: # index of groups with same number of antries as current branch
@@ -618,28 +634,42 @@ def get_groups(data=None):
                                 nonempty_count+=1 # this swap works.
                     # from above, there should be as many nonempties as entries (i.e. a&b&c iff a&b & a&c & b&c)
                     if nonempty_count == n_labels: # require that every subgroup had a nonzero entry.        
-                        supergroup_labels = [l for k in [branch_labels, [j]] for l in k]
+                        supergroup_labels = [l for k in [subgroup_labels, [j]] for l in k]
                         hqv = get_reg_qsl(data=data, reg_labels=supergroup_labels, logic='Intrs')
                         top = (np.sum(hqv[...,-1]) > 0)
                         vol = np.sum(hqv)
                         if vol > 0:
-                            print('overlap found for labels (',supergroup_labels,', vol: ',vol,', top: ',top,')')
-                            group_dict_list.append({'labels':supergroup_labels, 'vol':vol, 'top':top})
-                            group_branch_list.append(True)
-                            branch_count+=1
-
-    data['group_list'] = group_dict_list
-
-    ### note that this can be sped up -- there are two many calls to get_reg_qsl for domains that are known to be empty
-    ### to improve, should check presense of nonempty elements in lower set orders.
-    ### ideally this would all be extensible to arbitrary levels with a leaf/branch heirarchy
+                            iface_type = group_type(data=data, labels=supergroup_labels)
+                            print('overlap found for labels (',supergroup_labels,', vol: ',vol,', top: ',top,', iface: ',iface_type,')')
+                            group_dict_list.append({'labels':supergroup_labels, 'vol':vol, 'tree':None, 'top':top, 'iface':iface_type})
+                            group_dict_list[i]['tree'] = 'branch' # leaf found, so group becomes branch.
+                            new_groups = True
+                            
+    
+    # now we'll compare to the elements in any previous version and add them in
+    if key_name in data.keys():
+        print('adding to pre-existing entry for ',key_name)
+        data[key_name] = list(data[key_name])
+        for el in group_dict_list:
+            pdb.set_trace()
+            if el not in data[key_name]:
+                data[key_name].append(el)
+    else: data[key_name] = group_dict_list
 
     return data
-                
-                
-            
-        
-        
+
+def group_type(data=None, labels=None):
+    all_open = all([(label in data['open_labels'])     for label in labels])
+    all_clsd = all([(label in data['clsd_labels'])     for label in labels])
+    all_opos = all([(label in data['opos_labels'])     for label in labels])
+    all_oneg = all([(label not in data['opos_labels']) for label in labels])
+    if all_clsd:       iface_type='clsd_mxd'
+    elif all_open:
+        if all_opos:   iface_type='open_pos'
+        elif all_oneg: iface_type='open_neg'
+        else:          iface_type='open_mxd'
+    else:              iface_type='OCB'
+    return iface_type
 
 def make_null_box(data=None, null_num=None, box_size=None):
     if data==None:
@@ -741,36 +771,41 @@ def get_null_reg_dist(data=None, reg_labels=None, null_list=None):
         print('null list not supplied -- applying to all')
         null_list=range(N_null)
 
-    nll_dist_list=[]
-    nll_dist_list.append(reg_labels)
-    nll_dist_list.append(null_list)
-    nll_dist_array = np.zeros((np.size(reg_labels), np.size(null_list)))
-    nll_bool_array = np.zeros((np.size(reg_labels), np.size(null_list))).astype('bool')
-    print('Getting distances')
-    for i in range(np.size(reg_labels)):
-        msk = get_reg_qsl(data=data, reg_labels=reg_labels[i])
-        # ss_nonzero = np.nonzero(msk)
-        # for n in null_list:
-        #     nll_coord = make_null_box(data=data, null_num=n, box_size=2)
-        #     nll_dist = np.sqrt((irr - nll_coord[0][2])**2 + (ith - nll_coord[0][1])**2 + (iph - nll_coord[0][0])**2)[ss_nonzero].min()
-        #     nll_dist_array[i,n] = nll_dist
-        #     print('region: '+str(reg_labels[i])+', null: '+str(n)+', distance: '+str(nll_dist))
-        for j in range(np.size(null_list)):
-            n = null_list[j]
-            box = make_null_box(data=data, null_num=n, box_size=2)
-            for corner in box:
-                if data['q_segment'][corner]==reg_labels[i]: nll_bool_array[i,j]=True # does the null have a corner in the actual domain?
-            # we'll do measurements in sphericals but assuming orthonormality -- this is innacurate for large distances but we only care about small distances.
-            dist_rr = (data['crr'] - data['solrad']*data['null_locs'].T[n,2]) / metrr
-            dist_th = data['crr']*(np.pi / 180)*(data['cth'] - data['null_locs'].T[n,1]) / metth 
-            dist_ph = data['crr']*np.cos(data['cth']*np.pi/180)*(np.pi/180) * (data['cph'] - data['null_locs'].T[n,0]) / metph
-            nll_dist = np.sqrt(dist_rr**2 + dist_th**2 + dist_ph**2)[np.nonzero(msk)].min()
-            nll_dist_array[i,j] = nll_dist
-            print('region: '+str(reg_labels[i])+', null: '+str(n)+', distance: '+str(nll_dist))
+    int_distance = np.zeros((np.size(reg_labels), np.size(null_list))).astype('float16')
+    hqv_distance = np.zeros((np.size(reg_labels), np.size(null_list))).astype('float16')
 
-    nll_dist_list.append((nll_bool_array, nll_dist_array))
+    for j in range(np.size(null_list)):
+        n = null_list[j]
+        box = np.array(make_null_box(data=data, null_num=n, box_size=2)).T
+        box_indices = (box[0], box[1], box[2])
+        # we'll do measurements in sphericals but assuming orthonormality -- this is innacurate for large distances but we only care about small distances.
+        dist_rr = (data['crr'] - data['solrad']*data['null_locs'].T[n,2]) / metrr
+        dist_th = data['crr']*(np.pi / 180)*(data['cth'] - data['null_locs'].T[n,1]) / metth 
+        dist_ph = data['crr']*np.cos(data['cth']*np.pi/180)*(np.pi/180) * (data['cph'] - data['null_locs'].T[n,0]) / metph
+        dist_mm = np.sqrt(dist_rr**2 + dist_th**2 + dist_ph**2)
+        del dist_rr, dist_th, dist_ph
+        for i in range(np.size(reg_labels)):
+            # have to get the mask for the region qsl
+            hqv_msk = get_reg_qsl(data=data, reg_labels=reg_labels[i])
+            # test the typical hqv mask at the null box
+            hqv_box_dist = np.mean(~hqv_msk[box_indices])
+            if (hqv_box_dist < 0.5): # mostly inside domain.
+                hqv_distance[i,j] = hqv_box_dist
+            else:
+                hqv_distance[i,j] = max(0.5, dist_mm[np.nonzero(hqv_msk)].min())
+            int_msk = data['q_segment'] == reg_labels[i]
+            # test the typical int msk at the null box
+            int_box_dist = np.mean(~int_msk[box_indices])
+            if (int_box_dist < 0.5):
+                int_distance[i,j] = int_box_dist
+            else:
+                int_distance[i,j] = max(0.5, dist_mm[np.nonzero(int_msk)].min())
+            # with these conventions, the distance can go to zero, even if the null is not centered on a given pixel.
+            print('region: '+str(reg_labels[i])+', null: '+str(n)+', hqv distance: '+str(hqv_distance[i,j])+', int distance:'+str(int_distance[i,j]))
+
+    data['nll_dist_dict'] = {'regions': reg_labels, 'nulls': null_list, 'int_distance': int_distance, 'hqv_distance': hqv_distance}
     
-    return nll_dist_list
+    return data
         
             
 
