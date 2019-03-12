@@ -62,7 +62,7 @@ class Inputs(object):
     def __init__(self, nrr=None, nth=None, nph=None, phmin=None, phmax=None, thmin=None, thmax=None, rrmin=None, \
                  rrmax=None, r_samp=None, solrad=None, q_dir=None, b_dir=None, glbl_mdl=None, ss_eof=None, \
                  sbn_thrsh=None, ltq_thrsh=None, adj_thrsh=None, phi_bnd_thrsh=None, pad_ratio=None, bot_rad=None, \
-                 auto_imp=None, auto_seg=None, protocol=None):
+                 auto_imp=None, auto_seg=None, protocol=None, vis_title=None):
 
         self.nrr=nrr
         self.nth=nth
@@ -88,6 +88,7 @@ class Inputs(object):
         self.auto_imp=auto_imp
         self.auto_seg=auto_seg
         self.protocol=protocol
+        self.vis_title=vis_title
 
         ####################################################################
         # we'll keep a copy of the original inputs against future changes ##
@@ -145,8 +146,9 @@ class Result(object):
     ####################################################################
 
     def __init__(self, hqv_msk=None, GlnQp=None, reg_width=None, hqv_width=None, pad_msk=None, \
-                 vol_seg=None, seg_msk=None, adj_msk=None, groupings=None, null_to_reg_dist=None, \
-                 open_labels=None, clsd_labels=None, opos_labels=None, labels=None):
+                 vol_seg=None, seg_msk=None, adj_msk=None, intersections=None, detached_HQVs=None, \
+                 null_to_region_dist=None, null_to_detached_dist=None, \
+                 open_labels=None, clsd_labels=None, opos_labels=None, oneg_labels=None, labels=None):
 
         # and here are the new attributes, which are masks, intiger arrays, and lists of strings indicating groupings.
 
@@ -166,14 +168,17 @@ class Result(object):
         self.open_labels        =open_labels
         self.clsd_labels        =clsd_labels
         self.opos_labels        =opos_labels
+        self.oneg_labels        =oneg_labels
 
         # these come from post-processing on the various domain connectivities
 
-        self.adj_msk            =adj_msk
-        self.adj_msk_shape      =None
-        self.adj_msk_boolsize   =None
-        self.groupings          =groupings
-        self.null_to_reg_dist   =null_to_reg_dist
+        self.adj_msk               = adj_msk
+        self.adj_msk_shape         = None
+        self.adj_msk_boolsize      = None
+        self.intersections         = intersections
+        self.detached_HQVs         = detached_HQVs
+        self.null_to_region_dist   = null_to_region_dist
+        self.null_to_detached_dist = null_to_detached_dist
 
 
     ###########################
@@ -273,8 +278,10 @@ class Model(object):
 
     def do_group(self):
         self.determine_adjacency()
-        self.get_groups()
+        self.find_intersections()
+        self.find_detached_HQVs()
         self.get_null_reg_dist()
+        self.get_null_dtch_dist()
 
     def do_all(self):
         self.do_import()
@@ -293,6 +300,7 @@ class Model(object):
         for key in donor.__dict__.keys():
             if key in ['inputs', 'source', 'result']:
                 portattr(self, key, getattr(donor, key))
+        return self
 
     #################################################
     # methods for generating source #################
@@ -377,7 +385,8 @@ class Model(object):
 
         if not self.inputs.nrr:
             self.build_grid()
-        
+
+        import os
         import numpy as np
         import pandas as pd
 
@@ -386,10 +395,10 @@ class Model(object):
 
         # import assuming typical data format
         if self.inputs.protocol=='standard_QSLsquasher':
-            q_dir=self.inputs.q_dir
-            if not q_dir: q_dir='./'
+            if self.inputs.q_dir is None:
+                self.inputs.q_dir = os.getcwd()
             print('Loading Q data')
-            self.source.slog10q=(np.array(pd.read_table(q_dir+'/grid3d.dat',header=None).astype('float32')))[...,0].reshape((self.inputs.nph,self.inputs.nth,self.inputs.nrr))
+            self.source.slog10q=(np.array(pd.read_table(self.inputs.q_dir+'/grid3d.dat',header=None).astype('float32')))[...,0].reshape((self.inputs.nph,self.inputs.nth,self.inputs.nrr))
             print('Success        \n%%%%%%%%%%%%%%%%%%%%%%%%%%%%')
 
         
@@ -428,24 +437,24 @@ class Model(object):
 
         # import assuming typical data format
         if self.inputs.protocol=='standard_QSLsquasher':
-            b_dir=self.inputs.b_dir
-            q_dir=self.inputs.q_dir
-            if not b_dir:
-                if not q_dir: b_dir='./'
-                else: b_dir=q_dir+'/bfield_data/'
+            if self.inputs.b_dir is None:
+                if self.inputs.q_dir is None:
+                    self.inputs.b_dir = os.getcwd()+'/bfield_data/'
+                else:
+                    self.inputs.b_dir = self.inputs.q_dir+'/bfield_data/'
             print('Loading B data')
             # these are the native coordinates of the magnetic field grid
-            ph_mag = np.array(pd.read_table(b_dir+'/xs0.dat',header=None))[...,0].astype('float32')
-            th_mag = np.array(pd.read_table(b_dir+'/ys0.dat',header=None))[...,0].astype('float32')
-            rr_mag = np.array(pd.read_table(b_dir+'/zs0.dat',header=None))[...,0].astype('float32') * self.inputs.solrad
+            ph_mag = np.array(pd.read_table(self.inputs.b_dir+'/xs0.dat',header=None))[...,0].astype('float32')
+            th_mag = np.array(pd.read_table(self.inputs.b_dir+'/ys0.dat',header=None))[...,0].astype('float32')
+            rr_mag = np.array(pd.read_table(self.inputs.b_dir+'/zs0.dat',header=None))[...,0].astype('float32') * self.inputs.solrad
             nx=ph_mag.size
             ny=th_mag.size
             nz=rr_mag.size
             # these are the components of the magnetic field on the native grid
             # minus in b_theta is due to Griffiths' def
-            b_ph_nat =   (np.array(pd.read_table(b_dir+'/bx0.dat',header=None))[...,0].reshape((nz,ny,nx)) ).transpose((2,1,0)).astype('float32')
-            b_th_nat = - (np.array(pd.read_table(b_dir+'/by0.dat',header=None))[...,0].reshape((nz,ny,nx)) ).transpose((2,1,0)).astype('float32')
-            b_rr_nat =   (np.array(pd.read_table(b_dir+'/bz0.dat',header=None))[...,0].reshape((nz,ny,nx)) ).transpose((2,1,0)).astype('float32')
+            b_ph_nat =   (np.array(pd.read_table(self.inputs.b_dir+'/bx0.dat',header=None))[...,0].reshape((nz,ny,nx)) ).transpose((2,1,0)).astype('float32')
+            b_th_nat = - (np.array(pd.read_table(self.inputs.b_dir+'/by0.dat',header=None))[...,0].reshape((nz,ny,nx)) ).transpose((2,1,0)).astype('float32')
+            b_rr_nat =   (np.array(pd.read_table(self.inputs.b_dir+'/bz0.dat',header=None))[...,0].reshape((nz,ny,nx)) ).transpose((2,1,0)).astype('float32')
             # this is a check that the magnetic field is not corrupt
             if np.sum(np.array((np.isnan(b_ph_nat), np.isnan(b_th_nat), np.isnan(b_rr_nat)))) > 0:
                 if np.sum(np.isnan(b_ph_nat)) > 0:
@@ -490,11 +499,14 @@ class Model(object):
             self.source.brr = brr_interpolator(q_pts).T.reshape(self.source.cph.shape).astype('float32')
 
             print('Importing Null Locations \n%%%%%%%%%%%%%%%%%%%%%%%%%%%%')
-            null_loc_fname = b_dir+'/nullpositions.dat'
+            null_loc_fname = self.inputs.b_dir+'/nullpositions.dat'
             if os.path.isfile(null_loc_fname):
                 from scipy.io import readsav
                 null_dict=readsav(null_loc_fname, python_dict=True)
                 self.source.null_locs=null_dict['nulls'].astype('float32')
+                P_null=self.source.null_locs.T
+                P_null=P_null[np.argsort(P_null[:,2]),:]
+                self.source.null_locs = P_null.T
                 print('Null list imported.')
             else: print('Null list not found!')
             
@@ -559,7 +571,7 @@ class Model(object):
             else:
                 print('LTQ threshold specified by inputs obj as: ', self.inputs.ltq_thrsh)
         else:
-            print('LTQ tThreshold specified directly as: ', ltq_thrsh)
+            print('LTQ threshold specified directly as: ', ltq_thrsh)
             self.inputs.ltq_thrsh=ltq_thrsh
         self.inputs.ltq_thrsh=np.float32(self.inputs.ltq_thrsh)
 
@@ -624,24 +636,43 @@ class Model(object):
         if not self.inputs.bot_rad: self.inputs.bot_rad=np.float32(1.0)
 
         nph, nth, nrr = tuple(np.float32(self.result.hqv_msk.shape))
-    
-        self.result.vol_seg = np.zeros(self.source.slog10q.shape, dtype='int32')### initiate segmentation label array.
+
+        hqv_msk = self.result.hqv_msk
+        slog10q = self.source.slog10q
+        crr     = self.source.crr
+        brr     = self.source.brr
+        GlnQp   = self.result.GlnQp
+
+        # for global models, we have to blow out the dimensions in phi to move the boundary away
+        if self.inputs.glbl_mdl is None: self.inputs.glbl_mdl=True
+        
+        if self.inputs.glbl_mdl:
+            print('expanding to double-size domain')
+            hqv_msk = self.global_expand(hqv_msk)
+            slog10q = self.global_expand(slog10q)
+            crr     = self.global_expand(crr)
+            brr     = self.global_expand(brr)
+            GlnQp   = self.global_expand(GlnQp)
+            #(self.result.hqv_msk, self.source.slog10q, self.source.crr, self.source.brr, self.result.GlnQp) = (None, None, None, None, None)
+
+
+        vol_seg = np.zeros(hqv_msk.shape, dtype='int32')### initiate segmentation label array.
         # it's useful to have masks for open and closed flux. We consider undecided flux to be open.
-        opn_msk = (self.source.slog10q < 0)
+        opn_msk = (slog10q < 0)
         if self.inputs.ss_eof: opn_msk[...,-1]=True
-        cls_msk = (self.source.slog10q > 0)
-        nll_msk = (~opn_msk) & (~cls_msk)
+        cls_msk = (slog10q > 0)
 
         print('Calculating distance transforms')
 
         # it's also useful to have the distance from the interior of the hqv regions to their boundary, and the other way.
-        hqv_dist = ndi.distance_transform_edt(~self.result.hqv_msk).astype('float32') # distance to nearest hqv
-        self.result.reg_width = np.mean(4.*hqv_dist[np.nonzero(~self.result.hqv_msk)]).astype('float32') # full width is 4 times average distance to boundary
-        print('Vol width: ',self.result.reg_width)
-        reg_dist = ndi.distance_transform_edt( self.result.hqv_msk).astype('float32') # distance to nearest low q region
-        self.result.hqv_width = np.mean(4.*reg_dist[np.nonzero( self.result.hqv_msk)]).astype('float32') # full width is 4 times average distance to boundary
-        print('HQV width: ',self.result.hqv_width)
-        del reg_dist
+        # now we do our distance transform and masking
+        hqv_dist = ndi.distance_transform_edt(~hqv_msk).astype('float32') # distance to nearest hqv
+        reg_width = np.mean(4.*hqv_dist[np.nonzero(~hqv_msk)]).astype('float32') # full width is 4 times average distance to boundary
+        print('Vol width: ',reg_width)
+        reg_dist = ndi.distance_transform_edt(hqv_msk).astype('float32') # distance to nearest low q region
+        hqv_width = np.mean(4.*reg_dist[np.nonzero(hqv_msk)]).astype('float32') # full width is 4 times average distance to boundary
+        print('HQV width: ',hqv_width)
+        del(reg_dist)
 
         print('Performing discrete flux labeling')
 
@@ -649,116 +680,78 @@ class Model(object):
 
         # now we'll label the open flux domains, above min height.
         # we'll pad the hqv mask by a distance proportionate to the hqv_halfwidth, including a radial scaling to accomodate thicker hqvs at larger radii
-        self.result.pad_msk = ( hqv_dist > self.inputs.pad_ratio * self.result.hqv_width * (self.source.crr / self.source.crr.mean()) ) # empirical radial dependence...
-        self.result.vol_seg -= (skim.label(self.result.pad_msk & (self.source.slog10q < 0) & (self.source.crr >= self.inputs.bot_rad * self.inputs.solrad))).astype('int32') # all pixels not within or adjacent to a hqv
-        self.result.open_labels = np.unique(self.result.vol_seg[np.nonzero(self.result.vol_seg < 0)])
-        # and we'll get the closed flux labels in the same way, also above min height.
-        self.result.vol_seg += skim.label(self.result.pad_msk & (self.source.slog10q > 0) & (self.source.crr >= self.inputs.bot_rad * self.inputs.solrad)) # all pixels not within or adjacent to a hqv
-        self.result.clsd_labels = np.unique(self.result.vol_seg[np.nonzero(self.result.vol_seg > 0)])
-
-        if not self.inputs.glbl_mdl: self.inputs.glbl_mdl=True
-        if self.inputs.glbl_mdl:
+        pad_msk = ( hqv_dist > self.inputs.pad_ratio * hqv_width * (crr / crr.mean()) ) # empirical radial dependence...
+        open_label_mask = pad_msk & (slog10q < 0) & (crr >= self.inputs.bot_rad * self.inputs.solrad)
+        clsd_label_mask = pad_msk & (slog10q > 0) & (crr >= self.inputs.bot_rad * self.inputs.solrad)
+        vol_seg = np.zeros(pad_msk.shape, dtype='int32')
+        vol_seg -= skim.label(open_label_mask).astype('int32') # all pixels not within or adjacent to a hqv
+        vol_seg += skim.label(clsd_label_mask).astype('int32') # all pixels not within or adjacent to a hqv
+        del(open_label_mask, clsd_label_mask)
             
-            print('Associating domains across ph=0 boundary')
-
-            if not self.inputs.phi_bnd_thrsh: self.inputs.phi_bnd_thrsh=0.5
-
-            # now we'll associate regions across the phi boundary
-            # need the labels on the boundary
-            phb_seg = np.roll(self.result.vol_seg, 1, axis=0)[0:2,...] # this is just the 0,-1 columns stacked together
-            phb_regs = np.unique(phb_seg[np.nonzero(phb_seg)]) # these are the regions associated with the boundary
-            # and we need to know if the open regions are positive or negative to avoid accidental mixing.
-            opnflxpos=(phb_regs!=phb_regs) # this will boolean to say whether each region is [open and positive]
-            for i in np.arange(phb_regs.size):
-                ri = phb_regs[i]
-                if ri < 0: # test if open
-                    n_pos = np.sum(self.source.brr[...,-1][np.nonzero(self.result.vol_seg[...,-1]==ri)]>0) # positive area
-                    n_neg = np.sum(self.source.brr[...,-1][np.nonzero(self.result.vol_seg[...,-1]==ri)]<0) # negative area
-                    opnflxpos[i] = (n_pos > n_neg) # true if pos > neg -- this list is populated at least as fast as it is queried.
-
-            # now we can create a table of areas to be swapped
-            nregs = phb_regs.size
-            swap=np.zeros((nregs,nregs)).astype('bool')
-            for i in np.arange(nregs):
-                ri = phb_regs[i]
-                iopos=opnflxpos[i]
-                for j in np.arange(nregs):
-                    rj = phb_regs[j]
-                    jopos=opnflxpos[j]
-                    # we'll do a double mask and multiply.
-                    # if over threshold fit, then there are more matches on that pairing than all others combined.
-                    if ((ri != rj) & (ri*rj > 0) & (iopos==jopos)): # only consider same type flux -- skip redundant names.
-                        mi = ((phb_seg[0,...]==ri) & (self.result.hqv_msk[0,...]==0))
-                        mj = ((phb_seg[1,...]==rj) & (self.result.hqv_msk[1,...]==0))
-                        i_area = np.sum( mi ) 
-                        j_area = np.sum( mj )
-                        c_area = np.sum( (mi & mj) )
-                        if (c_area > 0):
-                            # compare c_area to min allowable: composed of the larger of ( local weighted hqv cross section , smaller of ( fraction of local individual areas))
-                            hqv_local_area_ave = np.sum( ( np.pi * (0.5*self.result.hqv_width)**2 * self.source.crr[0,...]**2 / self.source.crr.mean()**2 ) * (mi & mj) ) / c_area
-                            if c_area > np.max(( hqv_local_area_ave, self.inputs.phi_bnd_thrsh * np.min(( i_area, j_area )) )):        
-                                swap[i,j]=True
-
-            # now the actual swapping
-            swap = swap | swap.T     # first we consolidate the swap map to the minor diagonal
-            for i in np.arange(nregs):
-                ri = phb_regs[i]
-                i_swapped=False # this region hasn't been updated yet
-                for j in np.arange(i+1, nregs): # previous entries are redundant.
-                    rj = phb_regs[j]
-                    if (not i_swapped):
-                        if swap[i,j]:
-                            self.result.vol_seg[np.nonzero(self.result.vol_seg==ri)]=rj # i label -> j label, which hasn't be processed
-                            swap[j,:]=swap[i,:] # j entries inherit swapability from i entries. 
-                            i_swapped=True # ri has been swapped up to rj
-
-            # some cleanup
-            del phb_seg, phb_regs, opnflxpos, nregs, swap, ri, iopos, rj, jopos, mi, mj, i_area, j_area, c_area, hqv_local_area_ave, i_swapped
-
         print('Removing domains with sub-minimum volume')
-        for reg in np.unique(self.result.vol_seg[np.nonzero(self.result.vol_seg)]):
-            tmp_msk = (self.result.vol_seg == reg)
-            #print('region: '+str(reg)+', volume: '+str(np.sum(tmp_msk)))
-            if np.sum(tmp_msk * self.source.crr.mean()**2 / self.source.crr**2) < (0.5*self.result.hqv_width)**3: # threshold size for valid regions -- threshold increases quadratically with height to allow smaller closed domains
-                self.result.vol_seg = self.result.vol_seg * ~tmp_msk  # zero in mask, unchanged else.
-        del tmp_msk
+        
+        crr_mean = crr.mean()
+        hqv_vol = (0.5*hqv_width)**3
+        
+        for reg in np.unique(vol_seg[np.nonzero(vol_seg)]):
+            reg_ss = np.nonzero(vol_seg == reg)
+            # threshold size for valid regions -- threshold increases quadratically with height to allow smaller closed domains
+            # looks a bit odd. It's just sum over reg_ss.size, weighted by radial scaling, compared to hqv_vol. 
+            if np.sum(crr_mean**2 / crr[reg_ss]**2) < hqv_vol: 
+                vol_seg[reg_ss] = 0  # zero in mask, unchanged else.
+        del(reg_ss, crr_mean, hqv_vol)
+
+        # and we'll define the label groups for persistent open and closed domains
+        clsd_labels = np.unique(vol_seg[np.nonzero(vol_seg > 0)])
+        open_labels = np.unique(vol_seg[np.nonzero(vol_seg < 0)])
+        opos_labels=[]
+        oneg_labels=[]
+        for i in np.arange(open_labels.size):
+            ri = open_labels[i]
+            n_pos = np.sum(brr[...,-1][np.nonzero(vol_seg[...,-1]==ri)]>0) # positive area
+            n_neg = np.sum(brr[...,-1][np.nonzero(vol_seg[...,-1]==ri)]<0) # negative area
+            if (n_pos > 0) | (n_neg > 0):
+                if ((n_pos - n_neg)/(n_pos + n_neg)) > 0: opos_labels.append(ri)
+                if ((n_pos - n_neg)/(n_pos + n_neg)) < 0: oneg_labels.append(ri)
+        opos_labels=np.array(opos_labels)
+        oneg_labels=np.array(oneg_labels)
 
         print('Performing watershed backfill into HQV padding')
-        absQp = np.clip(np.absolute(self.source.slog10q), np.log10(2), 10).astype('float32')
-        log10_SNQ =  np.log10(absQp + (self.source.crr / self.source.crr.max()) * self.result.GlnQp**2).astype('float32')
-        del absQp
+        absQp = 10**np.clip(np.absolute(slog10q), np.log10(2), 10).astype('float32')
+        log10_SNQ =  np.log10(absQp + (crr / crr.max()) * GlnQp**2).astype('float32')
+        del(absQp)
 
         # Initial watershed phase
         # First we grow regions into the padding layer outside the hqv mask
         stime = time.time()
-        self.result.vol_seg += (mor.watershed(           log10_SNQ, self.result.vol_seg * opn_msk, mask=(opn_msk & ~self.result.hqv_msk), watershed_line=False) * ((self.result.vol_seg==0) & opn_msk & ~self.result.hqv_msk)).astype('int32')
+        vol_seg += (mor.watershed(log10_SNQ, vol_seg * opn_msk, mask=(opn_msk & ~hqv_msk), watershed_line=False) * ((vol_seg==0) & opn_msk & ~hqv_msk)).astype('int32')
         print('Open flux backfill completed in '+str(int(time.time()-stime))+' seconds')
         stime = time.time()
-        self.result.vol_seg += (mor.watershed(           log10_SNQ, self.result.vol_seg * cls_msk, mask=(cls_msk & ~self.result.hqv_msk), watershed_line=False) * ((self.result.vol_seg==0) & cls_msk & ~self.result.hqv_msk)).astype('int32')
+        vol_seg += (mor.watershed(log10_SNQ, vol_seg * cls_msk, mask=(cls_msk & ~hqv_msk), watershed_line=False) * ((vol_seg==0) & cls_msk & ~hqv_msk)).astype('int32')
         print('Clsd flux backfill completed in '+str(int(time.time()-stime))+' seconds')
 
         print('Enforcing boundary connectivity')
         # And we require that all regions are associated with a boundary
         # These loops are split up to allow for different definitions between open and closed domains
-        for reg in self.result.open_labels:
-            tmp_msk = (self.result.vol_seg == reg)
+        for reg in open_labels:
+            tmp_msk = (vol_seg == reg)
             if np.sum(tmp_msk[...,-1]) == 0: # open domains must intersect the top boundary
-                self.result.vol_seg = self.result.vol_seg * ~tmp_msk # zero in mask, unchanged else.
-        for reg in self.result.clsd_labels:
-            tmp_msk = (self.result.vol_seg == reg)
+                vol_seg = vol_seg * ~tmp_msk # zero in mask, unchanged else.
+        for reg in clsd_labels:
+            tmp_msk = (vol_seg == reg)
             if np.sum(tmp_msk[...,0]) == 0: # closed domains must intersection the bottom boundary.
-                self.result.vol_seg = self.result.vol_seg * ~tmp_msk # zero in mask, unchanged else.
-                del tmp_msk
-
+                vol_seg = vol_seg * ~tmp_msk # zero in mask, unchanged else.
+                del(tmp_msk)
+                
 
 
         print('Performing restricted watershed backfill into HQV mask')
         # Second, we grow regions using the same-type mask, which just expands open-open, close-close.
         stime = time.time()
-        self.result.vol_seg += (mor.watershed(           log10_SNQ, self.result.vol_seg * opn_msk, mask=opn_msk, watershed_line=False) * ((self.result.vol_seg==0) & opn_msk)).astype('int32')
+        vol_seg += (mor.watershed(log10_SNQ, vol_seg * opn_msk, mask=opn_msk, watershed_line=False) * ((vol_seg==0) & opn_msk)).astype('int32')
         print('Open flux backfill completed in '+str(int(time.time()-stime))+' seconds')
         stime = time.time()
-        self.result.vol_seg += (mor.watershed(           log10_SNQ, self.result.vol_seg * cls_msk, mask=cls_msk, watershed_line=False) * ((self.result.vol_seg==0) & cls_msk)).astype('int32')
+        vol_seg += (mor.watershed(log10_SNQ, vol_seg * cls_msk, mask=cls_msk, watershed_line=False) * ((vol_seg==0) & cls_msk)).astype('int32')
         print('Clsd flux backfill completed in '+str(int(time.time()-stime))+' seconds')
 
 
@@ -766,10 +759,10 @@ class Model(object):
         print('Performing transparent watershed backfill into HQV mask')
         # Third, we grow regions through opposite type, but only within a hqv, where type mixing is expected.
         stime = time.time()
-        self.result.vol_seg += (mor.watershed(           log10_SNQ, self.result.vol_seg * opn_msk, mask=self.result.hqv_msk, watershed_line=False) * ((self.result.vol_seg==0) & opn_msk)).astype('int32')
+        vol_seg += (mor.watershed(log10_SNQ, vol_seg * opn_msk, mask=hqv_msk, watershed_line=False) * ((vol_seg==0) & opn_msk)).astype('int32')
         print('Open flux backfill completed in '+str(int(time.time()-stime))+' seconds')
         stime = time.time()
-        self.result.vol_seg += (mor.watershed(           log10_SNQ, self.result.vol_seg * cls_msk, mask=self.result.hqv_msk, watershed_line=False) * ((self.result.vol_seg==0) & cls_msk)).astype('int32')
+        vol_seg += (mor.watershed(log10_SNQ, vol_seg * cls_msk, mask=hqv_msk, watershed_line=False) * ((vol_seg==0) & cls_msk)).astype('int32')
         print('Clsd flux backfill completed in '+str(int(time.time()-stime))+' seconds')
 
 
@@ -777,63 +770,112 @@ class Model(object):
         print('Performing watershed backfill into residual domains')
         # Finally, we grow null regions with no preference, allowing open and closed to compete.
         stime = time.time()
-        self.result.vol_seg += (mor.watershed(           1/(1 + hqv_dist), self.result.vol_seg,                         watershed_line=False) * ((self.result.vol_seg==0))).astype('int32')
+        vol_seg += (mor.watershed(           1/(1 + hqv_dist), vol_seg,                         watershed_line=False) * ((vol_seg==0))).astype('int32')
         print('Final flux backfill completed in '+str(int(time.time()-stime))+' seconds')
         # There may still be unnasigned regions. But these will be outliers buried deep within opposite flux types.
+        del(hqv_dist, opn_msk, cls_msk) # don't need these anymore
 
 
+        # get the pure interface boundaries from the domain map
+        seg_gx, seg_gy, seg_gz = np.gradient(vol_seg, axis=(0,1,2))
+        seg_msk = ((seg_gx**2 + seg_gy**2 + seg_gz**2) == 0)
+        del(seg_gx, seg_gy, seg_gz)
+
+        # Here we enforce periodicity
+        if self.inputs.glbl_mdl:
+            print('Associating labels across phi=0 boundary')
+            print('Closed flux...')
+            self.associate_labels(vol_seg, axis=0, label_subset=clsd_labels, mask=seg_msk, use_volume=True, exp_loop=False)
+            print('Open positive flux...')
+            self.associate_labels(vol_seg, axis=0, label_subset=opos_labels, mask=seg_msk, use_volume=True, exp_loop=False)
+            print('Open negative flux...')
+            self.associate_labels(vol_seg, axis=0, label_subset=oneg_labels, mask=seg_msk, use_volume=True, exp_loop=False)
+            # If global we need to restore the original array shape
+            # update interface boundaries from the domain map
+            seg_gx, seg_gy, seg_gz = np.gradient(vol_seg, axis=(0,1,2))
+            seg_msk = ((seg_gx**2 + seg_gy**2 + seg_gz**2) == 0)
+            del(seg_gx, seg_gy, seg_gz)
+            print('reducing from double-size domain')
+            vol_seg = self.global_reduce(vol_seg)
+            pad_msk = self.global_reduce(pad_msk)
+            hqv_msk = self.global_reduce(hqv_msk)
+            slog10q = self.global_reduce(slog10q)
+            crr     = self.global_reduce(crr)
+            brr     = self.global_reduce(brr)
+            GlnQp   = self.global_reduce(GlnQp)
+            seg_msk = self.global_reduce(seg_msk)
         
         print('Relabeling to remove obsolete domains') 
         # now let's relabel with integer labels removing gaps
-        self.result.open_labels = -np.unique(-self.result.vol_seg[np.nonzero(self.result.vol_seg < 0)]).astype('int32') # negative gets it in reverse order
-        self.result.clsd_labels =  np.unique( self.result.vol_seg[np.nonzero(self.result.vol_seg > 0)]).astype('int32')
-        # we want this to be a random reordering so we have to keep track of swapped regions to avoid multiple swaps.
-        open_relabel = np.arange(0, self.result.open_labels.size).astype('int32')
-        clsd_relabel = np.arange(0, self.result.clsd_labels.size).astype('int32')
-        np.random.seed(open_relabel.size) # repeatable random seed
-        np.random.shuffle(open_relabel) # random shuffle of domain order
-        np.random.seed(clsd_relabel.size) # repeatable random seed
-        np.random.shuffle(clsd_relabel) # random shuffle of domain order
+        # first we need this list of labels that persist
+        clsd_labels_old = np.unique(vol_seg[np.nonzero(vol_seg > 0)])
+        open_labels_old = np.unique(vol_seg[np.nonzero(vol_seg < 0)])
+        opos_labels_old = np.array([label for label in opos_labels if label in open_labels_old])
+        oneg_labels_old = np.array([label for label in oneg_labels if label in open_labels_old])
 
-        swapped = (self.result.vol_seg != self.result.vol_seg) # boolean to track already swapped domains
+        # now we generate new lists of same size with no gaps
+        open_labels = - np.arange(1, open_labels_old.size + 1).astype('int32')
+        opos_labels = - np.arange(1, opos_labels_old.size + 1).astype('int32')
+        oneg_labels = - np.arange(1, oneg_labels_old.size + 1).astype('int32') + opos_labels.min() # offset by largest negative opos label
+        clsd_labels = + np.arange(1, clsd_labels_old.size + 1).astype('int32')
 
-        for i in range(open_relabel.size):
-            swap_msk = ((self.result.vol_seg == self.result.open_labels[i]) & ~swapped)
-            self.result.vol_seg = (self.result.vol_seg * (~swap_msk) - (open_relabel[i]+1) * (swap_msk)).astype('int32')
-            swapped = swapped | swap_msk
+        # now we'll shuffle the ordering of the old ones to randomize the locations
+        np.random.seed(opos_labels_old.size) # repeatable random seed
+        np.random.shuffle(opos_labels_old) # random shuffle of domain order
+        np.random.seed(oneg_labels_old.size) 
+        np.random.shuffle(oneg_labels_old) # same for oneg
+        np.random.seed(clsd_labels_old.size)
+        np.random.shuffle(clsd_labels) # same for clsd
 
-        for i in range(clsd_relabel.size):
-            swap_msk = ((self.result.vol_seg == self.result.clsd_labels[i]) & ~swapped)
-            self.result.vol_seg = (self.result.vol_seg * (~swap_msk) + (clsd_relabel[i]+1) * (swap_msk)).astype('int32')
-            swapped = swapped | swap_msk
+        swapped = np.zeros(vol_seg.shape, dtype='bool') # boolean to track already swapped domains
+
+        for i in np.arange(opos_labels_old.size):
+            swap_msk = ((vol_seg == opos_labels_old[i]) & ~swapped)
+            swapped  = swapped | swap_msk
+            vol_seg[np.nonzero(swap_msk)] = opos_labels[i]
+        
+        for i in np.arange(oneg_labels_old.size):
+            swap_msk = ((vol_seg == oneg_labels_old[i]) & ~swapped)
+            swapped  = swapped | swap_msk
+            vol_seg[np.nonzero(swap_msk)] = oneg_labels[i]
+        
+        for i in np.arange(clsd_labels_old.size):
+            swap_msk = ((vol_seg == clsd_labels_old[i]) & ~swapped)
+            swapped  = swapped | swap_msk
+            vol_seg[np.nonzero(swap_msk)] = clsd_labels[i]
             
-        del swapped, swap_msk, open_relabel, clsd_relabel
-        self.result.open_labels = np.unique(self.result.vol_seg[np.nonzero(self.result.vol_seg  < 0)]).astype('int32')
-        self.result.clsd_labels = np.unique(self.result.vol_seg[np.nonzero(self.result.vol_seg  > 0)]).astype('int32')
-        self.result.labels      = np.unique(self.result.vol_seg[np.nonzero(self.result.vol_seg != 0)]).astype('int32')
+        del(swapped, swap_msk, opos_labels_old, oneg_labels_old, clsd_labels_old)
+
+        # get the whole label list anew
+        labels = np.unique(vol_seg[np.nonzero(vol_seg)])
 
         print('Finished segmenting volume')
 
-        # and to recover our domain boundaries
-        seg_gx, seg_gy, seg_gz = np.gradient(self.result.vol_seg, axis=(0,1,2))
-        self.result.seg_msk = ((seg_gx**2 + seg_gy**2 + seg_gz**2) == 0)
-        del seg_gx, seg_gy, seg_gz
-        print('Sorting open regions by flux sign')
-        opos_labels=[]
-        for i in np.arange(self.result.open_labels.size):
-            ri = self.result.open_labels[i]
-            n_pos = np.sum(self.source.brr[...,-1][np.nonzero(self.result.vol_seg[...,-1]==ri)]>0) # positive area
-            n_neg = np.sum(self.source.brr[...,-1][np.nonzero(self.result.vol_seg[...,-1]==ri)]<0) # negative area
-            if (n_pos > 0) | (n_neg > 0):
-                if ((n_pos - n_neg)/(n_pos + n_neg)) > 0: opos_labels.append(ri)
-            else:
-                print('Region ',ri,' has no boundary footprint')
+        # and store these permanently
+        self.result.reg_width          =reg_width
+        self.result.hqv_width          =hqv_width
+        self.result.pad_msk            =pad_msk
+        self.result.vol_seg            =vol_seg
+        self.result.seg_msk            =seg_msk
+        self.result.labels             =labels
+        self.result.open_labels        =open_labels
+        self.result.clsd_labels        =clsd_labels
+        self.result.opos_labels        =opos_labels
+        self.result.oneg_labels        =oneg_labels
         
-        self.result.opos_labels=np.array(opos_labels)
+        # these should be redundant definitions in the non-global case
+        # in the global case, these were set to None to save memory so we restore them here.
+        #self.result.hqv_msk            =hqv_msk
+        #self.source.slog10q            =slog10q
+        #self.source.crr                =crr
+        #self.source.brr                =brr
+        #self.result.GlnQp              =GlnQp
+
+        
 
         print('Success \n%%%%%%%%%%%%%%%%%%%%%%%%%%%%')
 
-
+        return 0
 
 
 
@@ -842,6 +884,194 @@ class Model(object):
         ########################
 
 
+
+
+
+
+
+        
+    def global_expand(self, input_array, in_place=None):
+        import numpy as np
+        if in_place is None: in_place = True
+        if in_place:
+            array = input_array
+        else:
+            array = input_array.copy()
+            
+        if array.shape[0] == self.inputs.nph:
+            array = np.roll(np.concatenate((array, array), axis=0), np.int(self.inputs.nph/2), axis=0)
+            return array
+        else:
+            print('Object dimensions must match global coordinate dimensions')
+            return -1
+
+        ########################
+        # end of method ########
+        ########################
+
+
+
+
+        
+    def global_reduce(self, input_array, in_place=None):
+        import numpy as np
+        if in_place is None: in_place = True
+        if in_place:
+            array = input_array
+        else:
+            array = input_array.copy()
+        if array.shape[0] == 2*self.inputs.nph:
+            array = np.roll(array, -np.int(self.inputs.nph/2), axis=0)[0:self.inputs.nph,...]
+            return array
+        else:
+            print('Object dimensions must match expanded global coordinate dimensions')
+            return -1
+
+        ########################
+        # end of method ########
+        ########################
+
+
+
+
+
+
+    def associate_labels(self, input_array, axis=None, use_boundary=None, use_volume=None, lft_index_range=None, rgt_index_range=None, label_subset=None, mask=None, in_place=None, return_pairs=None, exp_loop=None):
+
+        # this routine associates discrete domain labels across within the interior of the volume
+        # first we get the slices at the boundary of interest in the form of an index array
+        import time
+        import pdb
+        import numpy as np
+
+        if in_place is None: in_place = True
+        if return_pairs is None: return_pairs = False
+        if mask is None: mask=np.ones(input_array.shape, dtype='bool')
+        if axis is None: axis=0
+        if (lft_index_range is None) and (rgt_index_range is None):
+            if (use_volume is None) and (use_boundary is None):
+                use_boundary=True
+
+        if in_place:
+            label_array = input_array
+        else:
+            label_array = input_array.copy()
+
+        mp_ss = np.int32(label_array.shape[axis]/2)
+
+        stime = time.time()
+        
+        if axis==0:
+            if use_boundary:
+                lft_array = (label_array*mask)[0 , :, :]
+                rgt_array = (label_array*mask)[-1, :, :]
+            elif use_volume:
+                lft_array = (label_array*mask)[:mp_ss, :, :]
+                rgt_array = (label_array*mask)[mp_ss:, :, :]
+            else:
+                lft_array = (label_array*mask)[lft_index_range[0]:lft_index_range[1], :, :]
+                rgt_array = (label_array*mask)[rgt_index_range[0]:rgt_index_range[1], :, :]
+        elif axis==1:
+            if use_boundary:
+                lft_array = (label_array*mask)[:, 0 , :]
+                rgt_array = (label_array*mask)[:, -1, :]
+            elif use_volume:
+                lft_array = (label_array*mask)[:, :mp_ss, :]
+                rgt_array = (label_array*mask)[:, mp_ss:, :]
+            else:
+                lft_array = (label_array*mask)[:, lft_index_range[0]:lft_index_range[1], :]
+                rgt_array = (label_array*mask)[:, rgt_index_range[0]:rgt_index_range[1], :]
+        elif axis==2:
+            if use_boundary:
+                lft_array = (label_array*mask)[:, :,  0]
+                rgt_array = (label_array*mask)[:, :, -1]
+            elif use_volume:
+                lft_array = (label_array*mask)[:, :, :mp_ss]
+                rgt_array = (label_array*mask)[:, :, mp_ss:]
+            else:
+                lft_array = (label_array*mask)[:, :, lft_index_range[0]:lft_index_range[1]]
+                rgt_array = (label_array*mask)[:, :, rgt_index_range[0]:rgt_index_range[1]]
+        else: pass
+
+        # now we get the list of labels at the boundary, excluding zero entries.
+        lft_labels = np.array(np.unique(lft_array[np.nonzero(lft_array)]))
+        rgt_labels = np.array(np.unique(rgt_array[np.nonzero(rgt_array)]))
+
+        # we'll only consider labels in the reduced group if specified
+        if label_subset is None:
+            label_subset=np.sort(np.unique(list(set(lft_labels).union(set(rgt_labels)))))
+        elif type(label_subset) is type(list(())):
+            label_subset = np.array(label_subset)
+        elif type(label_subset) is type(np.array(())):
+            pass
+        else:
+            print('supplied label group must be a list or an array')
+            return -1
+        
+        lft_labels = [label for label in lft_labels if label in label_subset]
+        rgt_labels = [label for label in rgt_labels if label in label_subset]
+        
+        # and we set up a table to keep track of how these labels associate with each other
+        # row and column both must contain all entries, so the swap table will be build on the label_subset group
+        pair_map = np.zeros((label_subset.size, label_subset.size), dtype='bool')
+
+        # now we loop over these labels and look for cross matches.
+        for lft_label in lft_labels:
+            lft_idx = np.nonzero(label_subset == lft_label)
+            lft_msk = (lft_array == lft_label)
+            #print('masking left region:',lft_label)
+            if exp_loop is False:
+                rgt_matches = np.unique(rgt_array[np.nonzero(lft_msk)])
+                #print('found matches in region(s):',rgt_matches)
+                for rgt_label in rgt_matches:
+                    if (rgt_label != lft_label) and (rgt_label != 0):
+                        #print('recording match in region:',rgt_label)
+                        rgt_idx = np.nonzero(label_subset == rgt_label)
+                        pair_map[lft_idx, rgt_idx]=True
+            else:
+                for rgt_label in rgt_labels:
+                    #print('masking right region:',rgt_label)
+                    if (rgt_label != lft_label): # no reason to match against the same region
+                        rgt_idx = np.nonzero(label_subset == rgt_label)
+                        rgt_msk = (rgt_array == rgt_label)
+                        if np.max(lft_msk & rgt_msk):
+                            #print('recording match in region',rgt_label)
+                            pair_map[lft_idx,rgt_idx]=True
+
+        # symmetrize the pairwise mask 
+        pair_map = pair_map | pair_map.T
+        # and do the actual swapping
+        for i in range(label_subset.size):
+            swapped=False # begin with no swap history for this region
+            for j in range(i+1, label_subset.size): # previous entries are redundant.
+                if pair_map[i,j]:
+                    # print('relabeling',label_subset[i],'to',label_subset[j])
+                    # j entries inherit swapability from i entries.
+                    # only populate upper diagonal so that lower diagonal remains original
+                    pair_map[j,j::] = pair_map[j,j::] | pair_map[i,j::] 
+                    if not swapped: # if swapped already, there are no remaining i entries so we skip this.
+                        i_msk = (label_array==label_subset[i])
+                        # i label -> j label, which hasn't be processed
+                        label_array[np.nonzero(i_msk)] = label_subset[j]
+                        swapped=True
+                        
+        print('completed in',np.int32(time.time()-stime),'seconds')
+
+        if in_place:
+            return 0
+        elif return_pairs:
+            return label_array, pair_map
+        else:
+            return label_array
+
+        ########################
+        # end of method ########
+        ########################
+
+
+
+        
+        
         
 
     def determine_adjacency(self):
@@ -865,7 +1095,13 @@ class Model(object):
         for i in np.arange(nll):
             #print('Finding distance to region '+str(self.result.labels[i]))
             dist_i = ndi.distance_transform_edt( self.result.vol_seg != self.result.labels[i] ).astype('float32')
-            self.result.adj_msk[...,i] = ( dist_i <= ( np.float32(self.inputs.adj_thrsh) * self.result.hqv_width * self.source.crr / self.source.crr.mean() ) )
+            # we need to do it again with the whole thing shifted in phi to allow for shorter separations on the periodic boundary
+            roll_vol_seg = np.roll(self.result.vol_seg, np.int(self.inputs.nph/2), axis=0)
+            roll_dist_i = ndi.distance_transform_edt( roll_vol_seg != self.result.labels[i] ).astype('float32')
+            unroll_roll_dist_i = np.roll(roll_dist_i, -np.int(self.inputs.nph/2), axis=0)
+            # and we combine both versions
+            min_dist_i = np.minimum(dist_i, unroll_roll_dist_i)
+            self.result.adj_msk[...,i] = ( min_dist_i <= ( np.float32(self.inputs.adj_thrsh) * self.result.hqv_width * self.source.crr / self.source.crr.mean() ) )
             print('Finished with region',self.result.labels[i])
         print('Adjacency mask built')
 
@@ -928,7 +1164,7 @@ class Model(object):
         ########################
 
 
-    def get_groups(self, data=None, labels=None, group_name=None):
+    def find_intersections(self, labels=None, group_name=None):
         
         ###################################################################################################
         # this method builds a branch structure showing the various groups with non-trivial intersections #
@@ -938,36 +1174,35 @@ class Model(object):
 
         if labels is None:
             labels=self.result.labels
-            if not group_name: group_name='all_groups'
-        elif labels=='all':
-            labels=self.result.labels
-            if not group_name: group_name='all_groups'
-        elif labels=='open':
-            labels=self.result.open_labels
-            if not group_name: group_name='open_groups'
-        elif labels=='clsd':
-            labels=self.result.clsd_labels
-            if not group_name: group_name='clsd_groups'
-        elif labels=='opos':
-            labels=self.result.opos_labels
-            if not group_name: group_name='opos_groups'
-        elif labels=='oneg':
-            labels=[el for el in self.result.open_labels if el not in self.result.opos_labels]
-            if not group_name: group_name='oneg_groups'
-        elif type(labels)==list:
-            if not group_name: group_name='custom_group'
+            if group_name is None: group_name='all_regions'
+        elif type(labels) is type(''):
+            if labels=='all':
+                labels=self.result.labels
+                if group_name is None: group_name='all_regions'
+            elif labels=='open':
+                labels=self.result.open_labels
+                if group_name is None: group_name='open_regions'
+            elif labels=='clsd':
+                labels=self.result.clsd_labels
+                if group_name is None: group_name='clsd_regions'
+            elif labels=='opos':
+                labels=self.result.opos_labels
+                if group_name is None: group_name='opos_regions'
+            elif labels=='oneg':
+                labels=self.result.oneg_labels
+                if group_name is None: group_name='oneg_regions'
+        elif type(labels)==type([]) or type(labels)==type(np.array(())):
+            labels=np.array(labels)
+            if group_name is None: group_name='custom_group'
 
         def group_type(labels=None):
-            all_open = all([(label in self.result.open_labels)     for label in labels])
-            all_clsd = all([(label in self.result.clsd_labels)     for label in labels])
-            all_opos = all([(label in self.result.opos_labels)     for label in labels])
-            all_oneg = all([(label not in self.result.opos_labels) for label in labels])
-            if all_clsd:       iface_type='clsd_mxd'
-            elif all_open:
-                if all_opos:   iface_type='open_pos'
-                elif all_oneg: iface_type='open_neg'
-                else:          iface_type='open_mxd'
-            else:              iface_type='OCB'
+            clsd = np.max([(label in self.result.clsd_labels)     for label in labels])
+            opos = np.max([(label in self.result.opos_labels)     for label in labels])
+            oneg = np.max([(label in self.result.oneg_labels)     for label in labels])
+            iface_type=Foo()
+            setattr(iface_type, 'clsd', clsd)
+            setattr(iface_type, 'opos', opos)
+            setattr(iface_type, 'oneg', oneg)
             return iface_type
 
         group_list = []
@@ -984,32 +1219,36 @@ class Model(object):
                     iface_type = group_type(labels=group_labels)
                     #print('overlap found for labels (',group_labels,', vol: ',vol,', top: ',top,', iface: ',iface_type,')')
                     group_obj = Foo()
+                    setattr(group_obj, 'status', None)
                     setattr(group_obj, 'labels', group_labels)
                     setattr(group_obj, 'volume', vol)
-                    setattr(group_obj, 'tree',   None)
                     setattr(group_obj, 'top',    top)
                     setattr(group_obj, 'iface',  iface_type)
+                    setattr(group_obj, 'n_regs', 2)
+                    setattr(group_obj, 'children', [])
+                    setattr(group_obj, 'parents', [])
                     group_list.append(group_obj)
                 
         # now we explore depth with recursion
 
         print('Determining higher order overlap groups')
-        depth=0
+        n_regs=2
         new_groups=True # initialize number of groups to be explored.
         while new_groups:
-            depth+=1
-            print('Recursion level:',depth)
+            n_regs+=1
+            print('Recursion level:',n_regs-2)
             new_groups = False
             label_len_list = [len(grp.labels) for grp in group_list]
             for i in range(len(group_list)):
-                if not group_list[i].tree: # need to be explored
-                    group_list[i].tree = 'leaf' # leaf unless supporting smaller leaves -- then branch.
+                if group_list[i].status is None: # need to be explored
+                    group_list[i].status = 'clear' # checked
                     subgroup_labels = group_list[i].labels
                     n_labels = len(subgroup_labels)
                     ss_same_len_list, = np.nonzero(np.array(label_len_list)==n_labels) # index of groups with same number of antries as current group
                     for j in labels[np.nonzero(labels > max(subgroup_labels))]: # next label to add to group
                         # first we make sure that j has nonempty overlaps with the elements of the group
                         nonempty_count = 0
+                        parents=[i]
                         for k in range(n_labels):
                             test_labels = subgroup_labels.copy()
                             test_labels[k] = j # this is the branch group with the new index swapped in for one of the elements
@@ -1017,6 +1256,7 @@ class Model(object):
                             for ss_same_len in ss_same_len_list: # index of groups with same number of entries as current branch
                                 if group_list[ss_same_len].labels == test_labels:
                                     nonempty_count+=1 # this swap works.
+                                    parents.append(ss_same_len) # an equally valid parent entry
                         # from above, there should be as many nonempties as entries (i.e. a&b&c iff a&b & a&c & b&c)
                         if nonempty_count == n_labels: # require that every subgroup had a nonzero entry.        
                             supergroup_labels = [l for k in [subgroup_labels, [j]] for l in k]
@@ -1027,26 +1267,33 @@ class Model(object):
                                 iface_type = group_type(labels=supergroup_labels)
                                 #print('overlap found for labels (',supergroup_labels,', vol: ',vol,', top: ',top,', iface: ',iface_type,')')
                                 group_obj = Foo()
+                                setattr(group_obj, 'status', None)
                                 setattr(group_obj, 'labels', supergroup_labels)
                                 setattr(group_obj, 'volume', vol)
-                                setattr(group_obj, 'tree',   None)
                                 setattr(group_obj, 'top',    top)
                                 setattr(group_obj, 'iface',  iface_type)
+                                setattr(group_obj, 'n_regs', n_regs)
+                                setattr(group_obj, 'children', [])
+                                setattr(group_obj, 'parents', sorted(parents))
                                 group_list.append(group_obj)
-                                group_list[i].tree = 'branch' # leaf found, so group becomes branch.
+                                # give each parent credit for the new group
+                                for parent in parents:
+                                    group_list[parent].children.append(len(group_list) - 1)
                                 new_groups = True
 
         print('Overlap group search complete')
         # now we'll add the result to the list of groups.
-        if not self.result.groupings: self.result.groupings=Foo()
-        if hasattr(self.result.groupings, group_name):
-            print('Overwriting previous entry for group: ',group_name)
+        if self.result.intersections is None: self.result.intersections=Foo()
+        if hasattr(self.result.intersections, group_name):
+            print('Overwriting previous entry for group:',group_name)
         else:
-            print('Populating new entry for group: ',group_name)
-        setattr(self.result.groupings, group_name, group_list)
+            print('Populating new entry for group:',group_name)
+        setattr(self.result.intersections, group_name, group_list)
         
         print('Success \n%%%%%%%%%%%%%%%%%%%%%%%%%%%%')
 
+        return group_list
+    
         ########################
         # end of method ########
         ########################
@@ -1054,10 +1301,166 @@ class Model(object):
 
 
 
+
+    def find_detached_HQVs(self, labels=None, group_name=None):
+        
+        ####################################################################################################
+        # this method checks domain hqvs agains all hqv intersections to look for non-overlapping sections #
+        ####################################################################################################
+
+        import numpy as np
+        from scipy import ndimage as ndi
+        import skimage.measure as skim
+        from skimage import morphology as mor
+
+        if labels is None:
+            labels=self.result.open_labels
+            if group_name is None: group_name='open_regions'
+        elif type(labels) is type(''):
+            if labels=='all':
+                labels=self.result.labels
+                if group_name is None: group_name='all_regions'
+            elif labels=='open':
+                labels=self.result.open_labels
+                if group_name is None: group_name='open_regions'
+            elif labels=='clsd':
+                labels=self.result.clsd_labels
+                if group_name is None: group_name='clsd_regions'
+            elif labels=='opos':
+                labels=self.result.opos_labels
+                if group_name is None: group_name='opos_regions'
+            elif labels=='oneg':
+                labels=[el for el in self.result.open_labels if el not in self.result.opos_labels]
+                if group_name is None: group_name='oneg_regions'
+        elif type(labels)==type([]) or type(labels)==type(np.array(())):
+            labels=np.array(labels)
+            if group_name is None: group_name='custom_group'
+        
+        group_list=[]
+
+        print('Identifying non-interface HQVs')
+        
+        for reg in labels:
+
+            # get the hqv volume that is not part of an interface
+            reduced = list(self.result.labels[np.nonzero(self.result.labels != reg)])# all regions apart from the one specified...
+            reg_hqv = self.get_reg_hqv(labels=[reg])
+            ext_hqv = self.get_reg_hqv(labels=reduced, logic='Union')
+            vol_seg = self.result.vol_seg
+
+            # expand to allow growing through boundary
+            if self.inputs.glbl_mdl:
+                reg_hqv = self.global_expand(reg_hqv)
+                ext_hqv = self.global_expand(ext_hqv)
+                vol_seg = self.global_expand(vol_seg)
+                
+            # define auxilary masks
+            reg_ifc = reg_hqv & ext_hqv
+            reg_dtc = reg_hqv & ~reg_ifc
+            #del(reg_hqv, ext_hqv)
+            hqv_area = np.pi*(self.result.hqv_width)**2
+            hqv_vol = (4*np.pi/3)*(self.result.hqv_width)**3
+
+            # test volume for detached subvolumes
+            if np.sum(reg_dtc) > hqv_vol:
+                print('found detached hqv in excess of typical hqv volume for region',reg)
+                dist_to_ifc = ndi.distance_transform_edt(~reg_ifc & (vol_seg==reg) )
+                print('computed distances to interface')
+                msk = (reg_dtc & (dist_to_ifc > self.result.hqv_width))
+                msk = mor.closing(mor.opening(msk)) & ~reg_ifc
+                if np.sum(msk)==0:
+                    print('no significant detached features detected')
+                else:
+                    # discretely label objects
+                    subvols = skim.label(msk)
+                    # if global enforce periodicity and reduce to original grid
+                    badregs = np.zeros(subvols.shape, dtype='bool')
+                    sublabels = (np.unique(subvols[np.where(subvols!=0)]))
+
+                    # remove small objects
+                    
+                    print(sublabels.size,'unique contiguous features found -- filtering')
+                    for sublabel in sublabels:
+                        msk = (subvols == sublabel)
+                        msk_ind = np.where(subvols==sublabel)
+                        if ((np.sum(msk) > hqv_vol) and (dist_to_ifc[msk_ind].mean() > self.result.hqv_width) and msk[...,-1].max()):
+                            print('found significant detached segment in subregion',sublabel)
+                        else:
+                            subvols[msk_ind]=0
+                            badregs[msk_ind]=True                       
+
+                    old_sublabels = (np.unique(subvols[np.where(subvols!=0)]))
+                    # test to see if there's anything to work with.
+                    print(old_sublabels.size, 'unique contiguous feature(s) remain')
+                    if old_sublabels.size == 0: # only if something left to do...
+                        print('no significant features remain after filter')
+                    else:
+                        # surviving regions are grown back into mask
+                        print('calculating distance to new features')
+                        dist_to_reg = ndi.distance_transform_edt(subvols==0)
+                        print('growing features within threshold distance')
+                        reg_dtc_derivs = np.gradient(reg_dtc, axis=(0,1,2))
+                        reg_dtc_overlap = (np.sqrt(reg_dtc_derivs[0]**2 + reg_dtc_derivs[1]**2 + reg_dtc_derivs[2]**2)!=0) & reg_ifc
+                        subvols=mor.watershed(dist_to_reg, subvols, mask=((reg_dtc | reg_dtc_overlap) & ~badregs & (dist_to_reg < 2.0*self.result.hqv_width)))
+                        del(reg_dtc_derivs, dist_to_reg)
+                        # inclusion of the distance threshold limits growth along surface of ifc to keep structure compact.
+                        # now we reduce if global
+                        if self.inputs.glbl_mdl:
+                            subvols = self.global_reduce(subvols)
+                            vol_seg = self.global_reduce(vol_seg)
+                            reg_hqv = self.global_reduce(reg_hqv)
+                            ext_hqv = self.global_reduce(ext_hqv)
+                            reg_ifc = self.global_reduce(reg_ifc)
+                            reg_dtc = self.global_reduce(reg_dtc)
+                            reg_dtc_overlap = self.global_reduce(reg_dtc_overlap)
+                            self.associate_labels(subvols, axis=0, use_boundary=True)
+                        # renumber to remove missing entries
+                        old_sublabels = (np.unique(subvols[np.where(subvols!=0)])) 
+                        swapped = np.zeros(subvols.shape, dtype='bool')
+                        for i in range(old_sublabels.size):
+                            ss = np.where((subvols==old_sublabels[i]) & ~swapped)
+                            swapped[ss]=True
+                            subvols[ss] = i+1
+                        del(swapped, old_sublabels)
+                        # now test overlap with other domains to see if fully detached or polar
+                        fully_detached = []
+                        pole_artefact = []
+                        sublabels = np.unique(subvols[np.nonzero(subvols)])
+                        for i in range(sublabels.size):
+                            fully_detached.append(False)
+                            pole_artefact.append(False)
+                            submask = (subvols==sublabels[i])
+                            if ( submask & reg_dtc_overlap ).max() == 0: fully_detached[i]=True
+                            if ( submask[:,0,:].max() == 1 ) | ( submask[:,-1,:].max() == 1 ): pole_artefact[i]=True
+
+                        dtc_obj = Foo()
+                        setattr(dtc_obj, 'region', reg)
+                        setattr(dtc_obj, 'subvol', subvols)
+                        setattr(dtc_obj, 'sublabels', np.unique(subvols[np.nonzero(subvols)]))
+                        setattr(dtc_obj, 'fully_detached', fully_detached)
+                        setattr(dtc_obj, 'pole_artefact', pole_artefact)
+                        group_list.append(dtc_obj)
+
+
+        print('Detached HQV search complete')
+        # now we'll add the result to the list of groups.
+        if self.result.detached_HQVs is None: self.result.detached_HQVs=Foo()
+        if hasattr(self.result.detached_HQVs, group_name):
+            print('Overwriting previous entry for group: ',group_name)
+        else:
+            print('Populating new entry for group: ',group_name)
+        setattr(self.result.detached_HQVs, group_name, group_list)
+        
+        print('Success \n%%%%%%%%%%%%%%%%%%%%%%%%%%%%')
+
+        return group_list
     
+        ########################
+        # end of method ########
+        ########################
 
 
-
+        
 
     def make_null_box(self, null_num=None, box_size=None):
 
@@ -1116,10 +1519,12 @@ class Model(object):
 
         import numpy as np
 
+        print('finding distances from nulls to discrete domains')
+
         if labels is None:
             print('region list not supplied -- selecting all')
             labels = self.result.labels
-            labelname='all_labels'
+            labelname='all_regions'
 
         null_locs = self.source.null_locs
         N_null=null_locs.shape[1]
@@ -1129,8 +1534,8 @@ class Model(object):
             null_list=np.arange(N_null)
             nullname='all_nulls'
         
-        int_distance = np.zeros((np.size(labels), np.size(null_list))).astype('float32')
-        hqv_distance = np.zeros((np.size(labels), np.size(null_list))).astype('float32')
+        int_distance = np.zeros((np.size(null_list), np.size(labels))).astype('float32')
+        hqv_distance = np.zeros((np.size(null_list), np.size(labels))).astype('float32')
 
         for j in range(np.size(null_list)):
             n = null_list[j]
@@ -1150,16 +1555,16 @@ class Model(object):
                 # test the typical hqv mask at the null box
                 hqv_box_dist = np.mean(~hqv_msk[box_indices])
                 if (hqv_box_dist < 0.5): # mostly inside domain.
-                    hqv_distance[i,j] = hqv_box_dist
+                    hqv_distance[j,i] = hqv_box_dist
                 else:
-                    hqv_distance[i,j] = max(0.5, dist_mm[np.nonzero(hqv_msk)].min())
+                    hqv_distance[j,i] = max(0.5, dist_mm[np.nonzero(hqv_msk)].min())
                 int_msk = (self.result.vol_seg == labels[i])
                 # test the typical int msk at the null box
                 int_box_dist = np.mean(~int_msk[box_indices])
                 if (int_box_dist < 0.5):
-                    int_distance[i,j] = int_box_dist
+                    int_distance[j,i] = int_box_dist
                 else:
-                    int_distance[i,j] = max(0.5, dist_mm[np.nonzero(int_msk)].min())
+                    int_distance[j,i] = max(0.5, dist_mm[np.nonzero(int_msk)].min())
                 # with these conventions, the distance can go to zero, even if the null is not centered on a given pixel.
                 #print('region: '+str(labels[i])+', null: '+str(n)+', hqv distance: '+str(hqv_distance[i,j])+', int distance:'+str(int_distance[i,j]))
 
@@ -1169,10 +1574,16 @@ class Model(object):
         setattr(dist_object, 'int_distance', np.float32(int_distance))
         setattr(dist_object, 'hqv_distance', np.float32(hqv_distance))
 
-        if (labelname == 'all_labels') and (nullname == 'all_nulls'):
-            print('Populating exhaustive list')
-            self.result.null_to_reg_dist = dist_object
-        else: return dist_object
+        if self.result.null_to_region_dist is None:
+            self.result.null_to_region_dist = Foo()
+
+        try:
+            setattr(self.result.null_to_region_dist, labelname+'_'+nullname, dist_object)
+        except AttributeError:
+            print('cannot set attribute of null_to_region_dist')
+            return
+
+        return dist_object
         
         print('Success \n%%%%%%%%%%%%%%%%%%%%%%%%%%%%')
 
@@ -1182,6 +1593,92 @@ class Model(object):
         ########################
         # end of method ########
         ########################
+
+
+    def get_null_dtch_dist(self, groupname=None, null_list=None):
+
+        ############################################################################################################
+        # this method gets the distnaces from each null to each detached segment, in the form of a list of objects #
+        ############################################################################################################
+
+        import numpy as np
+
+        print('finding distances from nulls to detached HQVs')
+        
+        if groupname is None:
+            print('group not supplied -- selecting open')
+            groupname = 'open_regions'
+
+        if not hasattr(self.result.detached_HQVs, groupname):
+            print(groupname,'not defined for list of detached HQVs')
+            return
+
+        null_locs = self.source.null_locs
+        N_null=null_locs.shape[1]
+
+        if null_list is None:
+            print('null list not supplied -- selecting all')
+            null_list=np.arange(N_null)
+            nullname='all_nulls'
+        
+        hqv_distance = []
+
+        for j in range(np.size(null_list)):
+            hqv_distance.append([])
+            n = null_list[j]
+            box = np.array(self.make_null_box(null_num=n, box_size=2)).T
+            box_indices = (box[0], box[1], box[2])
+            # we'll do measurements in sphericals but assuming orthonormality -- this is innacurate for large distances but we only care about small distances.
+            # dividing by the metrics locally puts the distances into pixels, for easy comparison to the hqv_width, also in pixels.
+            dist_rr = (self.source.crr - self.inputs.solrad*self.source.null_locs.T[n,2]) / self.source.metrr
+            dist_th = self.source.crr*(np.pi / 180)*(self.source.cth - self.source.null_locs.T[n,1]) / self.source.metth 
+            dist_ph = self.source.crr*np.cos(self.source.cth*np.pi/180)*(np.pi/180) * (self.source.cph - self.source.null_locs.T[n,0]) / self.source.metph
+            dist_mm = np.sqrt(dist_rr**2 + dist_th**2 + dist_ph**2)
+            del dist_rr, dist_th, dist_ph
+            print('finding distances to null:',n)
+            domain_axis=[]
+            sublabel_axis=[]
+            for obj in getattr(self.result.detached_HQVs,groupname):
+                # have to get the detached hqvs in the region, if any
+                print('testing detached segments in region',obj.region)
+                for sublabel in obj.sublabels:
+                    print('checking distance to subregion',obj.region,':',sublabel)
+                    domain_axis.append(obj.region)
+                    sublabel_axis.append(sublabel)
+                    # have to get the mask for the detached segment
+                    hqv_msk = (obj.subvol==sublabel)
+                    # test the typical hqv mask at the null box
+                    hqv_box_dist = np.mean(~hqv_msk[box_indices])
+                    if (hqv_box_dist < 0.5): # mostly inside domain.
+                        hqv_distance[j].append(hqv_box_dist)
+                    else:
+                        hqv_distance[j].append(max(0.5, dist_mm[np.nonzero(hqv_msk)].min()))
+
+        dist_object = Foo()
+        setattr(dist_object, 'regions', np.int32(domain_axis))
+        setattr(dist_object, 'subregions', np.int32(sublabel_axis))
+        setattr(dist_object, 'nulls', np.int32(null_list))
+        setattr(dist_object, 'hqv_distance', np.array(hqv_distance, dtype='float32'))
+
+        if self.result.null_to_detached_dist is None:
+            self.result.null_to_detached_dist = Foo()
+
+        try:
+            setattr(self.result.null_to_detached_dist, groupname+'_'+nullname, dist_object)
+        except AttributeError:
+            print('cannot set attribute of null_to_region_dist')
+            return
+
+        print('Success \n%%%%%%%%%%%%%%%%%%%%%%%%%%%%')
+        
+        return dist_object
+
+        
+
+
+        ########################
+        # end of method ########
+        ########################        
 
 
     def get_nll_regs(null_list=None):
@@ -1222,7 +1719,6 @@ class Model(object):
 
         # get nulls
         null_locs=self.result.null_locs.T
-        null_locs=null_locs[np.argsort(null_locs[:,2]),:]
         N_null=null_locs.shape[0]
 
         # find overlap
@@ -1321,11 +1817,7 @@ class Model(object):
         model = pickle_load(fname)
         
         ### iterate over restored contents and populate model attributes.
-        for key in model.__dict__.keys():
-            if key[0] != '_':
-                setattr(self, key, getattr(model, key))
-            else:
-                print('skipping attribute',key)
+        self.cloan(model)
         print('Model keys: '+str([key for key in model.__dict__.keys()])+ ' read from '+str(fname))
 
         if self.result.adj_msk is None:
@@ -1337,8 +1829,99 @@ class Model(object):
 
         return self
     
-    def export_vtk(self, fname=None, rr_rng=None, th_rng=None, ph_rng=None):
-        pass
+    def export_vtk(self, export_custom=None, export_model=None, fname=None, rr_rng=None, th_rng=None, ph_rng=None):
+
+        from pyevtk.hl import gridToVTK
+        import numpy as np
+
+        if fname==None: fname=self.inputs.q_dir+'/3dvis'
+        
+        if export_model  is None: export_model = True # default to model export.
+
+        # We'll transform the coordinates first
+        crr=0.      + self.source.crr
+        cth=np.pi/2 - self.source.cth*np.pi/180.
+        cph=0.      + self.source.cph*np.pi/180.
+
+        # First we need all of the coordinates in cartesian.
+        cxx=crr*np.cos(cph)*np.sin(cth)
+        cyy=crr*np.sin(cph)*np.sin(cth)
+        czz=crr*np.cos(cth)
+
+        # and the index ranges
+        nrr = crr.shape[2]
+        nth = crr.shape[1]
+        nph = crr.shape[0]
+
+        # first we determine the index range
+
+        if rr_rng is None:
+            rl, rr = 0, nrr
+        else:
+            rr_rng=list(i*data['solrad'] for i in rr_rng) # takes arg in units of solar radius
+            rr_rng.sort()
+            temp_msk = (((crr[0,0,:] >= rr_rng[0]) & (crr[0,0,:] <= rr_rng[1])))
+            if temp_msk.sum()==0: print('radial clip has no volume')
+            rl = np.argmax(temp_msk)
+            rr = nrr - 1 - np.argmax(temp_msk[::-1])
+
+        if th_rng is None:
+            tl, tr = 0, nth
+        else:
+            th_rng=list(np.pi/2 - i*np.pi/180. for i in th_rng) # takes arg in degrees and converts to polar angle
+            th_rng.sort()
+            temp_msk = (((cth[0,:,0] >= th_rng[0]) & (cth[0,:,0] <= th_rng[1])))
+            if temp_msk.sum()==0: print('latitudinal clip has no volume')
+            tl = np.argmax(temp_msk)
+            tr = nth - 1 - np.argmax(temp_msk[::-1])
+
+        if ph_rng is None:
+            pl, pr = 0, nph
+        else:
+            ph_rng=list(i*np.pi/180. for i in ph_rng) # takes arg in degrees and converts to azimuthal angle.
+            ph_rng.sort()
+            temp_msk = (((cph[:,0,0] >= ph_rng[0]) & (cph[:,0,0] <= ph_rng[1])))
+            if temp_msk.sum()==0: print('longitudinal clip has no volume')
+            pl = np.argmax(temp_msk)
+            pr = nph - 1 - np.argmax(temp_msk[::-1])
+
+
+        exportData = {}
+        if export_model:
+            bx=self.source.brr*np.sin(cth)*np.cos(cph) + self.source.bth*np.cos(cth)*np.cos(cph) + self.source.bph *(-np.sin(cph))
+            by=self.source.brr*np.sin(cth)*np.sin(cph) + self.source.bth*np.cos(cth)*np.sin(cph) + self.source.bph *( np.cos(cph))
+            bz=self.source.brr*np.cos(cth)             + self.source.bth*(-np.sin(cth))
+            exportData['slog10q'] = self.source.slog10q[pl:pr,tl:tr,rl:rr].copy()
+            exportData['bfield']  = (bx[pl:pr,tl:tr,rl:rr].copy(), by[pl:pr,tl:tr,rl:rr].copy(), bz[pl:pr,tl:tr,rl:rr].copy())
+            exportData['vol_seg'] = self.result.vol_seg[pl:pr,tl:tr,rl:rr].copy()
+            exportData['hqv_msk'] = self.result.hqv_msk[pl:pr,tl:tr,rl:rr].astype('uint8').copy()
+
+        if export_custom is not None:
+            try:
+                if type(export_custom) is type(np.array(())):
+                    print('exporting custom array')
+                    if export_custom.dtype is np.dtype('bool'):
+                        print('converting bool to u8')
+                        exportData['custom'] = export_custom[pl:pr,tl:tr,rl:rr].astype('uint8').copy()
+                    else:
+                        exportData['custom'] = export_custom[pl:pr,tl:tr,rl:rr].copy()
+                elif type(export_custom) is type({}):
+                    print('exporting custom dicionary')
+                    for key in export_custom.keys():
+                        if type(export_custom[key]) is type(np.array(())):
+                            print('dict el',key,'is array type')
+                            if export_custom[key].dtype is np.dtype('bool'):
+                                print('converting bool to u8')
+                                exportData[key]=export_custom[key][pl:pr,tl:tr,rl:rr].astype('uint8').copy()
+                            else:
+                                exportData[key]=export_custom[key][pl:pr,tl:tr,rl:rr].copy()
+            except:
+                print('failed to index custom object')
+                
+        gridToVTK(fname, cxx[pl:pr,tl:tr,rl:rr].copy(), cyy[pl:pr,tl:tr,rl:rr].copy(), czz[pl:pr,tl:tr,rl:rr].copy(),
+                  pointData = exportData)
+
+        return
     
 
 
@@ -1373,10 +1956,6 @@ class Model(object):
         labels = self.result.labels
         openlin = np.linspace(0, 1, np.size(labels[np.argwhere(labels < 0)]) + 1)[1:]
         clsdlin = np.linspace(0, 1, np.size(labels[np.argwhere(labels > 0)]) + 1)[1:]
-        if shuffle_colors:
-            from random import shuffle
-            shuffle(openlin)
-            shuffle(clsdlin)
         opencolors = plt.cm.winter(openlin)
         clsdcolors = plt.cm.autumn(clsdlin)
         whitecolor = plt.cm.binary(0)
@@ -1385,20 +1964,41 @@ class Model(object):
         cmap = mpl.colors.LinearSegmentedColormap.from_list('my_colormap', mycolors)
 
         return cmap
+
+    def mskcmap(self, base_cmap):
+
+        import numpy as np
+        import pylab as plt
+        import matplotlib as mpl
+
+        from matplotlib.colors import ListedColormap
+        if type(base_cmap) is str: base_cmap = plt.cm.get_cmap(base_cmap)
+        else:
+            print('argument must be a colarmap name string')
+            return
+        mskcmap = base_cmap(np.arange(base_cmap.N))
+        mskcmap[:,-1]=np.linspace(0,1,base_cmap.N)
+        mskcmap=ListedColormap(mskcmap)
+
+        return mskcmap
+        
     
-    def visualize(self, window=None, figsize=None):
+    def visualize(self, window=None, figsize=None, cst_mask=None):
 
         import numpy as np
         import pylab as plt
         import matplotlib as mpl
         from matplotlib.widgets import Slider, RadioButtons, Button
 
+        font = {'family':'serif', 'serif': ['computer modern roman']}
+        plt.rc('text', usetex=True)
+        plt.rc('font',**font)
+
         rr=None
         th=None
         ph=None
         
         P_null=self.source.null_locs.T
-        P_null=P_null[np.argsort(P_null[:,2]),:]
         N_null=P_null.shape[0]
 
         # get coordinates
@@ -1449,29 +2049,39 @@ class Model(object):
         rr0, th0, ph0 = rr, th, ph
 
         dcube = self.source.slog10q
-        dmask = np.ones(dcube.shape, dtype='bool')
+        dmask = np.zeros(dcube.shape, dtype='bool')
         ctable ='viridis'
+        msk_ctable = self.mskcmap('spring_r')
         vrange = (-4,4)
 
         fig, axes = plt.subplots(num=window, nrows=2, ncols=2, gridspec_kw={'height_ratios': [(th_max-th_min),1.5*180/np.pi], 'width_ratios': [1.5*180/np.pi,(ph_max-ph_min)]})
-        im1 = axes[0,0].imshow((dcube*dmask)[iph,:,:]  , vmin=vrange[0], vmax=vrange[1], cmap=ctable, extent=[rr_min,rr_max,th_min,th_max], origin='lower', aspect=(np.pi/180))
-        im2 = axes[0,1].imshow((dcube*dmask)[:,:,irr].T, vmin=vrange[0], vmax=vrange[1], cmap=ctable, extent=[ph_min,ph_max,th_min,th_max], origin='lower', aspect=(1.))
-        im3 = axes[1,1].imshow((dcube*dmask)[:,ith,:].T, vmin=vrange[0], vmax=vrange[1], cmap=ctable, extent=[ph_min,ph_max,rr_min,rr_max], origin='lower', aspect=(180./np.pi))
+        im1 = axes[0,0].imshow((dcube)[iph,:,:]  , vmin=vrange[0], vmax=vrange[1], cmap=ctable, extent=[rr_min,rr_max,th_min,th_max], origin='lower', aspect=(np.pi/180))
+        im2 = axes[0,1].imshow((dcube)[:,:,irr].T, vmin=vrange[0], vmax=vrange[1], cmap=ctable, extent=[ph_min,ph_max,th_min,th_max], origin='lower', aspect=(1.))
+        im3 = axes[1,1].imshow((dcube)[:,ith,:].T, vmin=vrange[0], vmax=vrange[1], cmap=ctable, extent=[ph_min,ph_max,rr_min,rr_max], origin='lower', aspect=(180./np.pi))
+        im1m = axes[0,0].imshow((dmask)[iph,:,:]  , vmin=0, vmax=1, cmap=msk_ctable, extent=[rr_min,rr_max,th_min,th_max], origin='lower', aspect=(np.pi/180))
+        im2m = axes[0,1].imshow((dmask)[:,:,irr].T, vmin=0, vmax=1, cmap=msk_ctable, extent=[ph_min,ph_max,th_min,th_max], origin='lower', aspect=(1.))
+        im3m = axes[1,1].imshow((dmask)[:,ith,:].T, vmin=0, vmax=1, cmap=msk_ctable, extent=[ph_min,ph_max,rr_min,rr_max], origin='lower', aspect=(180./np.pi))
+        if self.inputs.vis_title is not None:
+            try: fig.suptitle(r'{0}'.format(self.inputs.vis_title), x=0.55, y=0.92, ha='center', fontsize=24)
+            except: pass
         ch1a, = axes[0,0].plot([rr_min,rr_max], [th,th], '--', linewidth=1, color='black')
         ch1b, = axes[0,0].plot([lr,lr], [th_min,th_max], '--', linewidth=1, color='black')
         ch2a, = axes[0,1].plot([ph_min,ph_max], [th,th], '--', linewidth=1, color='black')
         ch2b, = axes[0,1].plot([ph,ph], [th_min,th_max], '--', linewidth=1, color='black')
         ch3a, = axes[1,1].plot([ph_min,ph_max], [lr,lr], '--', linewidth=1, color='black')
         ch3b, = axes[1,1].plot([ph,ph], [rr_min,rr_max], '--', linewidth=1, color='black')
-        axes[0,0].set_ylabel(r'Latitude -- $\theta$ [deg]')
-        axes[0,0].set_xlabel(r'Radius -- $log_{10}~r$')
+        axes[0,0].set_ylabel(r'Latitude -- $\theta$ [deg]', fontsize=20)
+        axes[0,0].set_xlabel(r'Radius -- $r/R_\odot [log]$', fontsize=20)
         axes[0,0].yaxis.set_ticks(np.linspace(-60, 60, 5 ))
         axes[0,0].xaxis.set_ticks(np.linspace(1,  2.5, 2 ))
         axes[0,1].yaxis.set_ticks(np.linspace(-60, 60, 5 ))
-        axes[0,1].xaxis.set_ticks(np.linspace(0,  360, 7 ))
-        axes[1,1].set_xlabel(r'Longitude -- $\phi$ [deg]')
-        axes[1,1].xaxis.set_ticks(np.linspace(0,  360, 7 ))
+        axes[0,1].xaxis.set_ticks(np.linspace(0,  300, 6 ))
+        axes[1,1].set_xlabel(r'Longitude -- $\phi$ [deg]', fontsize=20)
+        axes[1,1].xaxis.set_ticks(np.linspace(0,  300, 6 ))
         axes[1,1].yaxis.set_ticks(np.linspace(1,  2.5, 2 ))
+        axes[0,0].tick_params(axis='both', labelsize=16)
+        axes[0,1].tick_params(axis='both', labelsize=16)
+        axes[1,1].tick_params(axis='both', labelsize=16)
         #axes[1,0].text(0.5, 0.6, r'Radius -- $R$ [solar radii]', transform=axes[1,0].transAxes, horizontalalignment='center', verticalalignment='center')
         #axes[1,0].text(0.5, 0.45, r'(log scaling)', transform=axes[1,0].transAxes, horizontalalignment='center', verticalalignment='center')
         #axes[1,0].text(0.5, 0.6, r'$log_{10}$ Radius', transform=axes[1,0].transAxes, horizontalalignment='center', verticalalignment='bottom')
@@ -1483,26 +2093,36 @@ class Model(object):
         ar1 = axes[0,1].annotate('', xy=(ph,  88), xytext=(-(45 + (2.5-lr)*180./np.pi),  88), arrowprops=dict(arrowstyle="<-", connectionstyle="arc,angleA=45, angleB=90, armA=21, armB=15, rad=8"), xycoords='data', textcoords='data')
         ar2 = axes[0,1].annotate('', xy=(360, th), xytext=(360,-(130 + (2.5-lr)*180./np.pi)), arrowprops=dict(arrowstyle="<-", connectionstyle="arc,angleA=45, angleB=0,  armA=21, armB=15, rad=8"), xycoords='data', textcoords='data')
         cbar_ax = fig.add_axes([0.85, 0.125, 0.05, 0.725])
-        cbar = fig.colorbar(im2, cax=cbar_ax, orientation = 'vertical', ticks=np.linspace(vrange[0], vrange[1], 5))
+        cbar = fig.colorbar(im2, cax=cbar_ax, orientation = 'vertical')
+        tickvals = np.linspace(vrange[0], vrange[1], 5)
+        ticknames = ['{:2.1f}'.format(i) for i in tickvals]
+        cbar.set_ticks(tickvals)
+        cbar.ax.set_yticklabels(ticknames)
+        cbar.ax.tick_params(labelsize=16)
+        cbar.set_label(r'slog$_{10}Q_\perp$', rotation=90, fontsize=20)
         axcolor = 'lightgoldenrodyellow'
-        axrr = plt.axes([0.075, 0.28, 0.15, 0.03], facecolor=axcolor)
-        axth = plt.axes([0.075, 0.23, 0.15, 0.03], facecolor=axcolor)
-        axph = plt.axes([0.075, 0.18, 0.15, 0.03], facecolor=axcolor)
-        axbp = plt.axes([0.075, 0.13, 0.05, 0.03], facecolor=axcolor)
-        axbn = plt.axes([0.175, 0.13, 0.05, 0.03], facecolor=axcolor)
-        axbr = plt.axes([0.125, 0.13, 0.05, 0.03], facecolor=axcolor)
-        axbt = plt.axes([0.230, 0.13, 0.02, 0.03], frameon=False)
+        axrr = plt.axes([0.125,   0.30, 0.12, 0.03], facecolor=axcolor)
+        axth = plt.axes([0.125,   0.27, 0.12, 0.03], facecolor=axcolor)
+        axph = plt.axes([0.125,   0.24, 0.12, 0.03], facecolor=axcolor)
+        axbp = plt.axes([0.125,   0.20, 0.04, 0.03], facecolor=axcolor)
+        axbr = plt.axes([0.165,   0.20, 0.04, 0.03], facecolor=axcolor)
+        axbn = plt.axes([0.205,   0.20, 0.04, 0.03], facecolor=axcolor)
+        axbt = plt.axes([0.249,   0.20, 0.04, 0.03], frameon=False)
         axbt.set_xticks([])
         axbt.set_yticks([])
-        rax1 = plt.axes([0.3, 0.9, 0.1, 0.08], facecolor=axcolor)
-        rax2 = plt.axes([0.5, 0.9, 0.1, 0.08], facecolor=axcolor)
-        rax3 = plt.axes([0.7, 0.9, 0.1, 0.08], facecolor=axcolor)
+        rax1 = plt.axes([0.125, 0.12, 0.04, 0.07], facecolor=axcolor)
+        rax1.text(0.5, -0.3, r'Data',  ha='center')
+        rax2 = plt.axes([0.165, 0.12, 0.04, 0.07], facecolor=axcolor)
+        rax2.text(0.5, -0.3, r'Mask',  ha='center')
+        rax3 = plt.axes([0.205, 0.12, 0.04, 0.07], facecolor=axcolor)
+        rax3.text(0.5, -0.3, r'Options', ha='center')
         null_label = axbt.text(0,0,'')
 
-        mask_key=None
+        mask_key='hqv_msk'
+        mask_opts='Disable'
         data_key='slog10q'
         inv_mask=False
-        draw_params={'rr':rr, 'th':th, 'ph':ph, 'mask_key':mask_key, 'data_key':data_key, 'inv_mask':inv_mask}
+        draw_params={'rr':rr, 'th':th, 'ph':ph, 'mask_key':mask_key, 'data_key':data_key, 'mask_opts':mask_opts, 'cst_mask':cst_mask}
 
         def redraw():
 
@@ -1512,7 +2132,8 @@ class Model(object):
             ph = draw_params['ph']
             data_key = draw_params['data_key']
             mask_key = draw_params['mask_key']
-            inv_mask = draw_params['inv_mask']
+            mask_opts = draw_params['mask_opts']
+            cst_mask = draw_params['cst_mask']
             # get coordinate indices
             if rr <= crr.min(): irr=0
             elif rr >= crr.max(): irr=-1
@@ -1530,7 +2151,7 @@ class Model(object):
             #th = cth[ith]
             #ph = cph[iph]
             lr=np.log(rr)*1.5/np.log(2.5)+1.
-            draw_params={'rr':rr, 'th':th, 'ph':ph, 'mask_key':mask_key, 'data_key':data_key, 'inv_mask':inv_mask}
+            draw_params={'rr':rr, 'th':th, 'ph':ph, 'mask_key':mask_key, 'data_key':data_key, 'mask_opts':mask_opts, 'cst_mask':cst_mask}
 
             if hasattr(self.source, data_key):
                 dcube=getattr(self.source, data_key)
@@ -1538,38 +2159,60 @@ class Model(object):
                 dcube=getattr(self.result, data_key)
             if data_key=='brr':
                 ctable='bwr_r'
+                msk_ctable = self.mskcmap('binary')
                 brms= np.around(np.sqrt((self.source.brr[...,irr]**2).mean()), decimals=2)
                 vrange = (-brms, brms)
             elif data_key=='slog10q':
                 ctable='viridis'
+                msk_ctable = self.mskcmap('spring_r')
                 vrange = (-4,4)
             elif data_key=='vol_seg':
                 ctable = self.segcmap()
+                msk_ctable = self.mskcmap('binary')
                 vrange = (dcube.min(), dcube.max())
             else:
                 print('unknown data key')
                 return
             
-            if not mask_key: dmask=np.ones(dcube.shape, dtype='bool')
+            if mask_key is None:
+                dmask=np.zeros(dcube.shape, dtype='bool')
             elif mask_key=='hqv_msk':
-                if inv_mask: dmask = self.result.hqv_msk
-                else: dmask = ~self.result.hqv_msk
+                dmask = self.result.hqv_msk
             elif mask_key=='seg_msk':
-                if inv_mask: dmask = ~self.result.seg_msk
-                else: dmask = self.result.seg_msk
+                dmask = ~self.result.seg_msk
+            elif mask_key=='custom':
+                if cst_mask is None:
+                    dmask=np.zeros(dcube.shape, dtype='bool')
+                else:
+                    dmask = cst_mask
+            else: pass
+            
+            if mask_opts=='Inverse':
+                dmask=~dmask
+            elif (mask_opts=='Disable') or (mask_opts is None):
+                dmask=np.zeros(dcube.shape, dtype='bool')
+            else: pass
 
-            nonlocal im1, im2, im3, ch1a, ch1b, ch2a, ch2b, ch3a, ch3b, ar1, ar2, cbar, null_label
+            nonlocal im1, im2, im3, im1m, im2m, im3m, ch1a, ch1b, ch2a, ch2b, ch3a, ch3b, ar1, ar2, cbar, null_label
 
             im1.set_cmap(ctable)
             im2.set_cmap(ctable)
             im3.set_cmap(ctable)
 
-            im1.set_data((dcube*dmask)[iph,:,:])
-            im2.set_data((dcube*dmask)[:,:,irr].T)
-            im3.set_data((dcube*dmask)[:,ith,:].T)
+            im1.set_data(dcube[iph,:,:])
+            im2.set_data(dcube[:,:,irr].T)
+            im3.set_data(dcube[:,ith,:].T)
             im1.set_clim(vmin=vrange[0], vmax=vrange[1])
             im2.set_clim(vmin=vrange[0], vmax=vrange[1])
             im3.set_clim(vmin=vrange[0], vmax=vrange[1])
+
+            im1m.set_data(dmask[iph,:,:])
+            im2m.set_data(dmask[:,:,irr].T)
+            im3m.set_data(dmask[:,ith,:].T)
+
+            im1m.set_cmap(msk_ctable)
+            im2m.set_cmap(msk_ctable)
+            im3m.set_cmap(msk_ctable)
 
             ch1a.set_ydata([th,th])
             ch1b.set_xdata([lr,lr])
@@ -1584,21 +2227,27 @@ class Model(object):
             ar2 = axes[0,1].annotate('', xy=(360, th), xytext=(360,-(130 + (2.5-lr)*180./np.pi)), arrowprops=dict(arrowstyle="<-", connectionstyle="arc,angleA=45, angleB=0,  armA=21, armB=15, rad=8"), xycoords='data', textcoords='data')
             null_label.remove()
             if null_vis:
-                null_label=axbt.text(0,0.5,r'$N_i=$'+str(c_null))
+                null_label=axbt.text(0,0.25,r'{0}'.format(str(c_null)))
             else:
                 null_label=axbt.text(0,0.5,'')
 
 
 
             if data_key == 'vol_seg':
-                tickvals = [dcube.min(), 0, dcube.max()]
-                ticknames = ['open', 'OCB', 'closed']
+                tickvals = [dcube.min(), dcube.max()]
+                ticknames = ['open', 'closed']
+                cbarlabel = ''
             else:
                 tickvals = np.linspace(vrange[0], vrange[1], 5)
-                ticknames = ['{:2.2f}'.format(i) for i in tickvals]
-
+                ticknames = ['{:2.1f}'.format(i) for i in tickvals]
+                if data_key == 'slog10q':
+                    cbarlabel='slog$_{10}Q_\perp$'
+                elif data_key == 'brr'  :
+                    cbarlabel='$B_r$ [Gauss]'
+                    
             cbar.set_ticks(tickvals)
             cbar.ax.set_yticklabels(ticknames)
+            cbar.set_label(r'{0}'.format(cbarlabel), rotation=90, fontsize=20)
 
             return 0
 
@@ -1646,26 +2295,27 @@ class Model(object):
 
         def update_mask_key(label):
             nonlocal draw_params
-            if label =='HQV mask':  draw_params['mask_key']='hqv_msk'
-            if label =='seg bound': draw_params['mask_key']='seg_msk'
-            if label =='No mask':   draw_params['mask_key']=None
+            if label =='HQV':  draw_params['mask_key']='hqv_msk'
+            if label =='$\delta \Omega_i$': draw_params['mask_key']='seg_msk'
+            if label =='custom':   draw_params['mask_key']='custom'
             #print(mask_key)
             redraw()
             fig.canvas.draw_idle()
 
         def update_data_key(label):
             nonlocal draw_params
-            if label=='slog10 Q':     draw_params['data_key']='slog10q'
-            if label=='seg map':      draw_params['data_key']='vol_seg'
-            if label=='radial field': draw_params['data_key']='brr'
+            if label=='$Q_\perp$':     draw_params['data_key']='slog10q'
+            if label=='$\Omega_i$':      draw_params['data_key']='vol_seg'
+            if label=='$B_r$': draw_params['data_key']='brr'
             #print(data_key)
             redraw()
             fig.canvas.draw_idle()
 
-        def update_inv_mask(label):
+        def update_mask_opts(label):
             nonlocal draw_params
-            if label=='Inverse Mask': draw_params['inv_mask']=True
-            if label=='Default Mask': draw_params['inv_mask']=False
+            if label=='Inverse': draw_params['mask_opts']='Inverse'
+            if label=='Normal': draw_params['mask_opts']='Normal'
+            if label=='Disable': draw_params['mask_opts']='Disable'
             #print(inv_msk)
             redraw()
             fig.canvas.draw_idle()
@@ -1706,17 +2356,17 @@ class Model(object):
             null_vis=False
             c_null = N_null-1
 
-        srr = Slider(axrr, r'$r$',       1.0, 2.5,  valinit=rr, valfmt="%2.3f")
+        srr = Slider(axrr, r'$r$',       1.0, 2.5,  valinit=rr, valfmt="%2.2f")
         sth = Slider(axth, r'$\theta$', -88., 88.,  valinit=th, valfmt="%2.1f")
-        sph = Slider(axph, r'$\phi$'  ,  0.0, 360., valinit=ph, valfmt="%2.1f")
+        sph = Slider(axph, r'$\phi$'  ,  0.0, 360., valinit=ph, valfmt="%2.0f")
 
-        data_selector_button = RadioButtons(rax1, ('slog10 Q', 'seg map', 'radial field'), active=0)    
-        mask_selector_button = RadioButtons(rax2, ('No mask', 'HQV mask', 'seg bound'), active=0)
-        inv_maskersion_button = RadioButtons(rax3, ('Default Mask', 'Inverse Mask'), active=0)
+        data_selector_button = RadioButtons(rax1, (r'$\Omega_i$', r'$Q_\perp$', r'$B_r$'), active=1)    
+        mask_selector_button = RadioButtons(rax2, (r'$\delta \Omega_i$', r'HQV', r'custom'), active=1)
+        inv_maskersion_button = RadioButtons(rax3, (r'Inverse', r'Disable', r'Normal'), active=1)
 
-        null_inc_button = Button(axbn, 'next null', color='w', hovercolor='b')
-        null_dec_button = Button(axbp, 'prev null', color='w', hovercolor='b')
-        reset_button = Button(axbr, 'reset', color='r', hovercolor='b')
+        null_inc_button = Button(axbn, 'next', color='w', hovercolor='b')
+        null_dec_button = Button(axbp, 'prev', color='w', hovercolor='b')
+        reset_button = Button(axbr, 'null', color='r', hovercolor='b')
         null_vis=False
         null_ini=False
         rr_nodraw=False
@@ -1735,15 +2385,15 @@ class Model(object):
 
         data_selector_button.on_clicked(update_data_key)
         mask_selector_button.on_clicked(update_mask_key)
-        inv_maskersion_button.on_clicked(update_inv_mask)
+        inv_maskersion_button.on_clicked(update_mask_opts)
 
         #rrbox.on_submit(subrr)
         #thbox.on_submit(subth)
         #phbox.on_submit(subph)
 
+        io_objects = (data_selector_button, mask_selector_button, inv_maskersion_button, null_inc_button, null_dec_button, reset_button)
 
-
-        return data_selector_button, mask_selector_button, inv_maskersion_button, null_inc_button, null_dec_button, reset_button
+        return fig, io_objects
 
 
 ###################################################
@@ -1756,21 +2406,32 @@ def portattr(target_object, name, attribute):
     namelist = ['Inputs', 'Source', 'Result', 'Foo']
     classname = attribute.__class__.__name__
     if classname in namelist: # attribute is a class object unto itself
-        print('Attribute', name, 'is of type', classname, 'and must be set dynamically')
+        #print('Attribute', name, 'is of type', classname, 'and must be set dynamically')
         try:
             setattr(target_object, name, object.__new__(type(attribute))) # dynamically instantiate new instance
+            getattr(target_object, name).__init__()
             for key in attribute.__dict__.keys():
                 if key[0] != '_':
-                    print('Setting subattribute', key)
+                    if key not in getattr(target_object, name).__dict__.keys() and classname is not 'Foo':
+                        print('Setting unmatched attribute "',key,'" in object "',name,'"-- check version control.')
+                    #print('Setting subattribute', key)
                     portattr(getattr(target_object, name), key, getattr(attribute, key))
         except:
             print('Cannot instantiate',name)
     else: # attribute is simply object
-        print('Attribute', name, 'is not an HQVseg object. Attempting to set statically')
+        #print('Attribute', name, 'is not an HQVseg object. Attempting to set statically')
         try:
             setattr(target_object, name, attribute)
-            print('Attribute', name, 'set statically.')
+            #print('Attribute', name, 'set statically.')
         except AttributeError:
             print('Attribute', name, 'cannot be set.')
+
+
+
+
+            
+
+
+    
 
 
