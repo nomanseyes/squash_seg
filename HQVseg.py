@@ -542,7 +542,8 @@ class Model(object):
         ### in spherical, grad is d/dr, 1/r d/dth, 1/rsinth d/dph
         print('Calculating derivatives')
         ### we'll clip the datavalue before differentiating so that 10**value is within the range of float32
-        clip_slog10q = np.sign(self.source.slog10q)*np.clip(np.absolute(self.source.slog10q), np.log10(2), np.log10(np.finfo('float32').max)-1)
+        ltqmax = np.log10(np.finfo('float32').max)-1
+        clip_slog10q = np.clip(np.absolute(self.source.slog10q), -ltqmax, ltqmax)
         dslq_dph, dslq_dth, dslq_drr = np.gradient(np.log(10.) * clip_slog10q, np.pi*self.source.cph[:,0,0]/180, np.pi*self.source.cth[0,:,0]/180, self.source.crr[0,0,:], axis=(0,1,2))
         gdn_slq_ph = dslq_dph / np.cos(np.pi * self.source.cth / 180)
         del dslq_dph
@@ -550,7 +551,7 @@ class Model(object):
         del dslq_dth
         gdn_slq_rr = dslq_drr * self.source.crr
         del dslq_drr
-        absQp = 10.**np.absolute(clip_slog10q)
+        absQp = np.clip(10.**np.absolute(clip_slog10q), 2, 10**ltqmax)
     
         # ### construct grad Q magnitude
         self.result.GlnQp = np.sqrt(gdn_slq_ph**2 + gdn_slq_th**2 + gdn_slq_rr**2)
@@ -610,7 +611,7 @@ class Model(object):
 
 
 
-    def segment_volume(self):
+    def segment_volume(self, visualize=None):
 
         #########################################################
         # this method generates the domain map in the volume ####
@@ -676,22 +677,57 @@ class Model(object):
 
         print('Performing discrete flux labeling')
 
-        if not self.inputs.pad_ratio: self.inputs.pad_ratio=0.25 # default is pad out to a typical quarter-width.
+        if not self.inputs.pad_ratio: self.inputs.pad_ratio=0.2 # default is pad out to a typical quarter-width.
 
         # now we'll label the open flux domains, above min height.
         # we'll pad the hqv mask by a distance proportionate to the hqv_halfwidth, including a radial scaling to accomodate thicker hqvs at larger radii
-        pad_msk = ( hqv_dist > self.inputs.pad_ratio * hqv_width * (crr / crr.mean()) ) # empirical radial dependence...
+        #pad_msk = ( hqv_dist > self.inputs.pad_ratio * hqv_width * (crr / crr.mean()) ) # empirical radial dependence...
+        pad_msk = ( hqv_dist > self.inputs.pad_ratio * hqv_width ) # empirical radial dependence...
         open_label_mask = pad_msk & (slog10q < 0) & (crr >= self.inputs.bot_rad * self.inputs.solrad)
         clsd_label_mask = pad_msk & (slog10q > 0) & (crr >= self.inputs.bot_rad * self.inputs.solrad)
         vol_seg = np.zeros(pad_msk.shape, dtype='int32')
         vol_seg -= skim.label(open_label_mask).astype('int32') # all pixels not within or adjacent to a hqv
         vol_seg += skim.label(clsd_label_mask).astype('int32') # all pixels not within or adjacent to a hqv
+        # and we'll define the label groups open and closed domains
+        clsd_labels = np.unique(vol_seg[np.nonzero(vol_seg > 0)])
+        open_labels = np.unique(vol_seg[np.nonzero(vol_seg < 0)])
         del(open_label_mask, clsd_label_mask)
-            
-        print('Removing domains with sub-minimum volume')
+
+        if visualize is None: visualize=False
+        if visualize:
+            import pylab as plt
+            plt.figure(0)
+            plt.imshow(hqv_msk[...,-1].T, origin='lower')
+            plt.savefig(self.inputs.q_dir+'/hqv_msk.pdf')
+            plt.figure(1)
+            plt.imshow(pad_msk[...,-1].T, origin='lower')
+            plt.savefig(self.inputs.q_dir+'/pad_msk.pdf')
+            plt.figure(2)
+            plt.imshow(slog10q[...,-1].T, origin='lower', vmax=4, vmin=-4)
+            plt.savefig(self.inputs.q_dir+'/slog10q.pdf')
+            plt.figure(3)
+            plt.imshow(vol_seg[...,-1].T, origin='lower')
+            plt.savefig(self.inputs.q_dir+'/vol_seg1.pdf')
+
+        # Here we enforce periodicity
+        # This MUST be done before removing domains and growing.
+        # Otherwise small domains at the boundaries can be subsumed by larger domains.
+        # This can then lead to erroneous cross-matching.        
+        if self.inputs.glbl_mdl:
+            print('Reconciling labels for periodicity')
+            print('Clsd flux...')
+            self.associate_labels(vol_seg, axis=0, label_subset=clsd_labels, use_volume=True, exp_loop=False)
+            print('Open flux...')
+            self.associate_labels(vol_seg, axis=0, label_subset=open_labels, use_volume=True, exp_loop=False)
+
+        if visualize:
+            plt.figure(4)
+            plt.imshow(vol_seg[...,-1].T, origin='lower')
+            plt.savefig(self.inputs.q_dir+'/vol_seg2.pdf')
         
+        print('Removing domains with sub-minimum volume')
         crr_mean = crr.mean()
-        hqv_vol = (0.5*hqv_width)**3
+        hqv_vol = (4*np.pi/3)*(0.5*hqv_width)**3
         
         for reg in np.unique(vol_seg[np.nonzero(vol_seg)]):
             reg_ss = np.nonzero(vol_seg == reg)
@@ -701,26 +737,15 @@ class Model(object):
                 vol_seg[reg_ss] = 0  # zero in mask, unchanged else.
         del(reg_ss, crr_mean, hqv_vol)
 
-        # and we'll define the label groups for persistent open and closed domains
-        clsd_labels = np.unique(vol_seg[np.nonzero(vol_seg > 0)])
-        open_labels = np.unique(vol_seg[np.nonzero(vol_seg < 0)])
-        opos_labels=[]
-        oneg_labels=[]
-        for i in np.arange(open_labels.size):
-            ri = open_labels[i]
-            n_pos = np.sum(brr[...,-1][np.nonzero(vol_seg[...,-1]==ri)]>0) # positive area
-            n_neg = np.sum(brr[...,-1][np.nonzero(vol_seg[...,-1]==ri)]<0) # negative area
-            if (n_pos > 0) | (n_neg > 0):
-                if ((n_pos - n_neg)/(n_pos + n_neg)) > 0: opos_labels.append(ri)
-                if ((n_pos - n_neg)/(n_pos + n_neg)) < 0: oneg_labels.append(ri)
-        opos_labels=np.array(opos_labels)
-        oneg_labels=np.array(oneg_labels)
+        if visualize:
+            plt.figure(5)
+            plt.imshow(vol_seg[...,-1].T, origin='lower')
+            plt.savefig(self.inputs.q_dir+'/vol_seg3.pdf')
 
         print('Performing watershed backfill into HQV padding')
         absQp = 10**np.clip(np.absolute(slog10q), np.log10(2), 10).astype('float32')
         log10_SNQ =  np.log10(absQp + (crr / crr.max()) * GlnQp**2).astype('float32')
         del(absQp)
-
         # Initial watershed phase
         # First we grow regions into the padding layer outside the hqv mask
         stime = time.time()
@@ -730,20 +755,11 @@ class Model(object):
         vol_seg += (mor.watershed(log10_SNQ, vol_seg * cls_msk, mask=(cls_msk & ~hqv_msk), watershed_line=False) * ((vol_seg==0) & cls_msk & ~hqv_msk)).astype('int32')
         print('Clsd flux backfill completed in '+str(int(time.time()-stime))+' seconds')
 
-        print('Enforcing boundary connectivity')
-        # And we require that all regions are associated with a boundary
-        # These loops are split up to allow for different definitions between open and closed domains
-        for reg in open_labels:
-            tmp_msk = (vol_seg == reg)
-            if np.sum(tmp_msk[...,-1]) == 0: # open domains must intersect the top boundary
-                vol_seg = vol_seg * ~tmp_msk # zero in mask, unchanged else.
-        for reg in clsd_labels:
-            tmp_msk = (vol_seg == reg)
-            if np.sum(tmp_msk[...,0]) == 0: # closed domains must intersection the bottom boundary.
-                vol_seg = vol_seg * ~tmp_msk # zero in mask, unchanged else.
-                del(tmp_msk)
-                
-
+        if visualize:
+            plt.figure(6)
+            plt.imshow(vol_seg[...,-1].T, origin='lower')
+            plt.savefig(self.inputs.q_dir+'/vol_seg4.pdf')
+            
 
         print('Performing restricted watershed backfill into HQV mask')
         # Second, we grow regions using the same-type mask, which just expands open-open, close-close.
@@ -754,47 +770,142 @@ class Model(object):
         vol_seg += (mor.watershed(log10_SNQ, vol_seg * cls_msk, mask=cls_msk, watershed_line=False) * ((vol_seg==0) & cls_msk)).astype('int32')
         print('Clsd flux backfill completed in '+str(int(time.time()-stime))+' seconds')
 
+        if visualize:
+            plt.figure(7)
+            plt.imshow(vol_seg[...,-1].T, origin='lower')
+            plt.savefig(self.inputs.q_dir+'/vol_seg5.pdf')
 
+        print('Removing open domains without exterior footprint')
+        # And we require that all regions are associated with a boundary
+        # These loops are split up to allow for different definitions between open and closed domains
+        opos_labels=[]
+        oneg_labels=[]
+        for ri in open_labels:
+            ri_msk = (vol_seg[...,-1] == ri)
+            # first we make sure there is an unmasked footprint
+            if (ri_msk & ~hqv_msk[...,-1]).max():
+                # open domains must have a net signed radial flux at the top boundary.
+                # if the flux at the top is zero the region is invalid, and will be subsumed by an adjacent region.
+                bi = np.sum(brr[...,-1][np.nonzero(ri_msk)])
+                if bi > 0: opos_labels.append(ri)
+                elif bi < 0: oneg_labels.append(ri)
+                else: vol_seg[np.nonzero(vol_seg == ri)] = 0
+            else: vol_seg[np.nonzero(vol_seg == ri)] = 0
+        opos_labels = np.array(opos_labels)
+        oneg_labels = np.array(oneg_labels)
+
+        if visualize:
+            plt.figure(8)
+            plt.imshow(vol_seg[...,-1].T, origin='lower')
+            plt.savefig(self.inputs.q_dir+'/vol_seg6.pdf')
 
         print('Performing transparent watershed backfill into HQV mask')
         # Third, we grow regions through opposite type, but only within a hqv, where type mixing is expected.
         stime = time.time()
-        vol_seg += (mor.watershed(log10_SNQ, vol_seg * opn_msk, mask=hqv_msk, watershed_line=False) * ((vol_seg==0) & opn_msk)).astype('int32')
+        vol_seg += (mor.watershed(log10_SNQ, vol_seg * opn_msk, mask=hqv_msk, watershed_line=False, compactness=1) * ((vol_seg==0) & opn_msk)).astype('int32')
         print('Open flux backfill completed in '+str(int(time.time()-stime))+' seconds')
         stime = time.time()
-        vol_seg += (mor.watershed(log10_SNQ, vol_seg * cls_msk, mask=hqv_msk, watershed_line=False) * ((vol_seg==0) & cls_msk)).astype('int32')
+        vol_seg += (mor.watershed(log10_SNQ, vol_seg * cls_msk, mask=hqv_msk, watershed_line=False, compactness=1) * ((vol_seg==0) & cls_msk)).astype('int32')
         print('Clsd flux backfill completed in '+str(int(time.time()-stime))+' seconds')
 
-
+        if visualize:
+            plt.figure(9)
+            plt.imshow(vol_seg[...,-1].T, origin='lower')
+            plt.savefig(self.inputs.q_dir+'/vol_seg7.pdf')
 
         print('Performing watershed backfill into residual domains')
         # Finally, we grow null regions with no preference, allowing open and closed to compete.
         stime = time.time()
-        vol_seg += (mor.watershed(           1/(1 + hqv_dist), vol_seg,                         watershed_line=False) * ((vol_seg==0))).astype('int32')
+        vol_seg += (mor.watershed(           1/(1 + hqv_dist), vol_seg,       watershed_line=False, compactness=1) * ((vol_seg==0))).astype('int32')
+        vol_seg += (mor.watershed(           1/(1 + hqv_dist), vol_seg,       watershed_line=False, compactness=1) * ((vol_seg==0))).astype('int32')
         print('Final flux backfill completed in '+str(int(time.time()-stime))+' seconds')
         # There may still be unnasigned regions. But these will be outliers buried deep within opposite flux types.
         del(hqv_dist, opn_msk, cls_msk) # don't need these anymore
 
+        if visualize:
+            plt.figure(10)
+            plt.imshow(vol_seg[...,-1].T, origin='lower')
+            plt.savefig(self.inputs.q_dir+'vol_seg8.pdf')
+        
+        print('Relabeling to remove obsolete domains') 
+        # now let's relabel with integer labels removing gaps
+        # first we need this list of labels that persist
+        persistent_clsd_labels = np.unique(vol_seg[np.nonzero(vol_seg > 0)])
+        persistent_open_labels = np.unique(vol_seg[np.nonzero(vol_seg < 0)])
+        persistent_opos_labels = np.unique(list(set(opos_labels).intersection(set(persistent_open_labels))))
+        persistent_oneg_labels = np.unique(list(set(oneg_labels).intersection(set(persistent_open_labels))))
 
+        # now we generate new lists of same size with no gaps
+        open_labels = - np.arange(1, persistent_open_labels.size + 1).astype('int32')
+        opos_labels = - np.arange(1, persistent_opos_labels.size + 1).astype('int32')
+        oneg_labels = - np.arange(1, persistent_oneg_labels.size + 1).astype('int32') + opos_labels.min() # offset by largest negative opos label
+        clsd_labels = + np.arange(1, persistent_clsd_labels.size + 1).astype('int32')
+
+        # and just quickly make these monotonic
+        open_labels.sort()
+        opos_labels.sort()
+        oneg_labels.sort()
+        clsd_labels.sort()
+
+        # now we'll shuffle the ordering of the old ones to randomize the locations
+        np.random.seed(persistent_open_labels.size) # repeatable random seed
+        np.random.shuffle(persistent_open_labels) # random shuffle of domain order
+        np.random.seed(persistent_opos_labels.size)
+        np.random.shuffle(persistent_opos_labels)
+        np.random.seed(persistent_oneg_labels.size)
+        np.random.shuffle(persistent_oneg_labels)
+        np.random.seed(persistent_clsd_labels.size)
+        np.random.shuffle(persistent_clsd_labels) # same for clsd
+
+        swapped = np.zeros(vol_seg.shape, dtype='bool') # boolean to track already swapped domains
+
+        for i in np.arange(opos_labels.size):
+            swap_msk = ((vol_seg == persistent_opos_labels[i]) & ~swapped)
+            swapped  = swapped | swap_msk
+            vol_seg[np.nonzero(swap_msk)] = opos_labels[i]
+        
+        for i in np.arange(oneg_labels.size):
+            swap_msk = ((vol_seg == persistent_oneg_labels[i]) & ~swapped)
+            swapped  = swapped | swap_msk
+            vol_seg[np.nonzero(swap_msk)] = oneg_labels[i]
+        
+        for i in np.arange(clsd_labels.size):
+            swap_msk = ((vol_seg == persistent_clsd_labels[i]) & ~swapped)
+            swapped  = swapped | swap_msk
+            vol_seg[np.nonzero(swap_msk)] = clsd_labels[i]
+            
+        del(swapped, swap_msk, persistent_opos_labels, persistent_oneg_labels, persistent_open_labels, persistent_clsd_labels)
+
+        # get the whole label list anew
+        labels = np.unique(vol_seg[np.nonzero(vol_seg)])
+        # sanity checks:
+        if set(labels) != set(open_labels).union(set(clsd_labels)):
+            print('open and closed labels do not span the domain')
+            pdb.set_trace()
+        if set(open_labels) != set(opos_labels).union(set(oneg_labels)):
+            print('opos and oneg labels do no span the open domain')
+            pdb.set_trace()
+        if set(opos_labels).intersection(set(oneg_labels)) != set([]):
+            print('opos and oneg labels are not linearly independent')
+            pdb.set_trace()
+            
+        if visualize:
+            plt.figure(11)
+            plt.imshow(vol_seg[...,-1].T, origin='lower')
+            plt.savefig(self.inputs.q_dir+'/vol_seg9.pdf')
+
+        # This completes the segmentation.
+        print('Finished segmenting volume')
+
+        
+        # Now we just do a bit of book-keeping. 
         # get the pure interface boundaries from the domain map
         seg_gx, seg_gy, seg_gz = np.gradient(vol_seg, axis=(0,1,2))
         seg_msk = ((seg_gx**2 + seg_gy**2 + seg_gz**2) == 0)
         del(seg_gx, seg_gy, seg_gz)
 
-        # Here we enforce periodicity
+        # restore the original shape of the domain.
         if self.inputs.glbl_mdl:
-            print('Associating labels across phi=0 boundary')
-            print('Closed flux...')
-            self.associate_labels(vol_seg, axis=0, label_subset=clsd_labels, mask=seg_msk, use_volume=True, exp_loop=False)
-            print('Open positive flux...')
-            self.associate_labels(vol_seg, axis=0, label_subset=opos_labels, mask=seg_msk, use_volume=True, exp_loop=False)
-            print('Open negative flux...')
-            self.associate_labels(vol_seg, axis=0, label_subset=oneg_labels, mask=seg_msk, use_volume=True, exp_loop=False)
-            # If global we need to restore the original array shape
-            # update interface boundaries from the domain map
-            seg_gx, seg_gy, seg_gz = np.gradient(vol_seg, axis=(0,1,2))
-            seg_msk = ((seg_gx**2 + seg_gy**2 + seg_gz**2) == 0)
-            del(seg_gx, seg_gy, seg_gz)
             print('reducing from double-size domain')
             vol_seg = self.global_reduce(vol_seg)
             pad_msk = self.global_reduce(pad_msk)
@@ -804,52 +915,8 @@ class Model(object):
             brr     = self.global_reduce(brr)
             GlnQp   = self.global_reduce(GlnQp)
             seg_msk = self.global_reduce(seg_msk)
-        
-        print('Relabeling to remove obsolete domains') 
-        # now let's relabel with integer labels removing gaps
-        # first we need this list of labels that persist
-        clsd_labels_old = np.unique(vol_seg[np.nonzero(vol_seg > 0)])
-        open_labels_old = np.unique(vol_seg[np.nonzero(vol_seg < 0)])
-        opos_labels_old = np.array([label for label in opos_labels if label in open_labels_old])
-        oneg_labels_old = np.array([label for label in oneg_labels if label in open_labels_old])
 
-        # now we generate new lists of same size with no gaps
-        open_labels = - np.arange(1, open_labels_old.size + 1).astype('int32')
-        opos_labels = - np.arange(1, opos_labels_old.size + 1).astype('int32')
-        oneg_labels = - np.arange(1, oneg_labels_old.size + 1).astype('int32') + opos_labels.min() # offset by largest negative opos label
-        clsd_labels = + np.arange(1, clsd_labels_old.size + 1).astype('int32')
 
-        # now we'll shuffle the ordering of the old ones to randomize the locations
-        np.random.seed(opos_labels_old.size) # repeatable random seed
-        np.random.shuffle(opos_labels_old) # random shuffle of domain order
-        np.random.seed(oneg_labels_old.size) 
-        np.random.shuffle(oneg_labels_old) # same for oneg
-        np.random.seed(clsd_labels_old.size)
-        np.random.shuffle(clsd_labels) # same for clsd
-
-        swapped = np.zeros(vol_seg.shape, dtype='bool') # boolean to track already swapped domains
-
-        for i in np.arange(opos_labels_old.size):
-            swap_msk = ((vol_seg == opos_labels_old[i]) & ~swapped)
-            swapped  = swapped | swap_msk
-            vol_seg[np.nonzero(swap_msk)] = opos_labels[i]
-        
-        for i in np.arange(oneg_labels_old.size):
-            swap_msk = ((vol_seg == oneg_labels_old[i]) & ~swapped)
-            swapped  = swapped | swap_msk
-            vol_seg[np.nonzero(swap_msk)] = oneg_labels[i]
-        
-        for i in np.arange(clsd_labels_old.size):
-            swap_msk = ((vol_seg == clsd_labels_old[i]) & ~swapped)
-            swapped  = swapped | swap_msk
-            vol_seg[np.nonzero(swap_msk)] = clsd_labels[i]
-            
-        del(swapped, swap_msk, opos_labels_old, oneg_labels_old, clsd_labels_old)
-
-        # get the whole label list anew
-        labels = np.unique(vol_seg[np.nonzero(vol_seg)])
-
-        print('Finished segmenting volume')
 
         # and store these permanently
         self.result.reg_width          =reg_width
@@ -862,14 +929,6 @@ class Model(object):
         self.result.clsd_labels        =clsd_labels
         self.result.opos_labels        =opos_labels
         self.result.oneg_labels        =oneg_labels
-        
-        # these should be redundant definitions in the non-global case
-        # in the global case, these were set to None to save memory so we restore them here.
-        #self.result.hqv_msk            =hqv_msk
-        #self.source.slog10q            =slog10q
-        #self.source.crr                =crr
-        #self.source.brr                =brr
-        #self.result.GlnQp              =GlnQp
 
         
 
@@ -936,7 +995,8 @@ class Model(object):
 
 
 
-    def associate_labels(self, input_array, axis=None, use_boundary=None, use_volume=None, lft_index_range=None, rgt_index_range=None, label_subset=None, mask=None, in_place=None, return_pairs=None, exp_loop=None):
+    def associate_labels(self, input_array, axis=None, use_boundary=None, use_volume=None, lft_index_range=None, rgt_index_range=None, \
+                         label_subset=None, mask=None, in_place=None, return_pairs=None, exp_loop=None):
 
         # this routine associates discrete domain labels across within the interior of the volume
         # first we get the slices at the boundary of interest in the form of an index array
@@ -1088,7 +1148,7 @@ class Model(object):
         # nearer to that region than the threshold
 
         nph, nth, nrr, nll = self.inputs.nph, self.inputs.nth, self.inputs.nrr, self.result.labels.size
-        self.result.adj_msk = np.zeros((nph, nth, nrr, nll), dtype='bool')
+        self.result.adj_msk = np.zeros((nph, nth, nrr, nll), dtype='uint8')
 
         # here we calculate distance transforms
         print('Comparing region specific EDT to hqv_width')
@@ -1102,7 +1162,10 @@ class Model(object):
             # and we combine both versions
             min_dist_i = np.minimum(dist_i, unroll_roll_dist_i)
             self.result.adj_msk[...,i] = ( min_dist_i <= ( np.float32(self.inputs.adj_thrsh) * self.result.hqv_width * self.source.crr / self.source.crr.mean() ) )
-            print('Finished with region',self.result.labels[i])
+            if self.result.labels[i]==self.result.clsd_labels.max():
+                print('Finished with Closed regions')
+            if self.result.labels[i]==self.result.open_labels.max():
+                print('Finished with Open regions')
         print('Adjacency mask built')
 
         print('Success              \n%%%%%%%%%%%%%%%%%%%%%%%%%%%%')
@@ -1164,7 +1227,7 @@ class Model(object):
         ########################
 
 
-    def find_intersections(self, labels=None, group_name=None):
+    def find_intersections(self, labels=None, group_name=None, return_list=None):
         
         ###################################################################################################
         # this method builds a branch structure showing the various groups with non-trivial intersections #
@@ -1173,8 +1236,8 @@ class Model(object):
         import numpy as np
 
         if labels is None:
-            labels=self.result.labels
-            if group_name is None: group_name='all_regions'
+            labels=self.result.open_labels
+            if group_name is None: group_name='open_regions'
         elif type(labels) is type(''):
             if labels=='all':
                 labels=self.result.labels
@@ -1199,13 +1262,11 @@ class Model(object):
             clsd = np.max([(label in self.result.clsd_labels)     for label in labels])
             opos = np.max([(label in self.result.opos_labels)     for label in labels])
             oneg = np.max([(label in self.result.oneg_labels)     for label in labels])
-            iface_type=Foo()
-            setattr(iface_type, 'clsd', clsd)
-            setattr(iface_type, 'opos', opos)
-            setattr(iface_type, 'oneg', oneg)
-            return iface_type
+            return clsd, opos, oneg
 
         group_list = []
+        # labels need to be monotonic as this is assumed below.
+        labels.sort()
 
         # first we append pairwise groupings
         print('Determining overlapping regions pairs')
@@ -1215,71 +1276,89 @@ class Model(object):
                 hqv = self.get_reg_hqv(labels=group_labels, logic='Intrs')
                 top = (np.sum(hqv[...,-1]) > 0)
                 vol = np.int32(np.sum(hqv))
+                pole = (hqv[:,0,:].max() | hqv[:,-1,:].max())
                 if vol > 0:
-                    iface_type = group_type(labels=group_labels)
-                    #print('overlap found for labels (',group_labels,', vol: ',vol,', top: ',top,', iface: ',iface_type,')')
-                    group_obj = Foo()
-                    setattr(group_obj, 'status', None)
-                    setattr(group_obj, 'labels', group_labels)
-                    setattr(group_obj, 'volume', vol)
-                    setattr(group_obj, 'top',    top)
-                    setattr(group_obj, 'iface',  iface_type)
-                    setattr(group_obj, 'n_regs', 2)
-                    setattr(group_obj, 'children', [])
-                    setattr(group_obj, 'parents', [])
-                    group_list.append(group_obj)
+                    clsd, opos, oneg = group_type(labels=group_labels)
+                    # here we must distinguish hqv intersections from genuine domain interface layers
+                    l1_bound_derivs = np.gradient(self.result.vol_seg==l1, axis=(0,1,2))
+                    l2_bound_derivs = np.gradient(self.result.vol_seg==l2, axis=(0,1,2))
+                    l1_bound = 0 < (l1_bound_derivs[0]**2 + l1_bound_derivs[1]**2 + l1_bound_derivs[2]**2)
+                    l2_bound = 0 < (l2_bound_derivs[0]**2 + l2_bound_derivs[1]**2 + l2_bound_derivs[2]**2)
+                    domain_interface = np.max(l1_bound & l2_bound) # only if the boundaries intersect is it a true interface
+                    del(l1_bound_derivs, l2_bound_derivs, l1_bound, l2_bound)
+                    new_group_obj = Foo()
+                    setattr(new_group_obj, 'status',     'new')
+                    setattr(new_group_obj, 'labels',     group_labels)
+                    setattr(new_group_obj, 'volume',     vol)
+                    setattr(new_group_obj, 'top',        top)
+                    setattr(new_group_obj, 'pole',       pole)
+                    setattr(new_group_obj, 'opos',       opos)
+                    setattr(new_group_obj, 'oneg',       oneg)
+                    setattr(new_group_obj, 'clsd',       clsd)
+                    setattr(new_group_obj, 'iface',      domain_interface)
+                    setattr(new_group_obj, 'n_regs',     2)
+                    setattr(new_group_obj, 'children',   [])
+                    setattr(new_group_obj, 'parents',    [])
+                    group_list.append(new_group_obj)
                 
         # now we explore depth with recursion
 
         print('Determining higher order overlap groups')
         n_regs=2
-        new_groups=True # initialize number of groups to be explored.
+        new_groups=[group for group in group_list if (group.status is 'new')] # initialize number of groups to be explored.
         while new_groups:
             n_regs+=1
-            print('Recursion level:',n_regs-2)
-            new_groups = False
-            label_len_list = [len(grp.labels) for grp in group_list]
-            for i in range(len(group_list)):
-                if group_list[i].status is None: # need to be explored
-                    group_list[i].status = 'clear' # checked
-                    subgroup_labels = group_list[i].labels
-                    n_labels = len(subgroup_labels)
-                    ss_same_len_list, = np.nonzero(np.array(label_len_list)==n_labels) # index of groups with same number of antries as current group
-                    for j in labels[np.nonzero(labels > max(subgroup_labels))]: # next label to add to group
-                        # first we make sure that j has nonempty overlaps with the elements of the group
-                        nonempty_count = 0
-                        parents=[i]
-                        for k in range(n_labels):
-                            test_labels = subgroup_labels.copy()
-                            test_labels[k] = j # this is the branch group with the new index swapped in for one of the elements
-                            test_labels = sorted(test_labels)
-                            for ss_same_len in ss_same_len_list: # index of groups with same number of entries as current branch
-                                if group_list[ss_same_len].labels == test_labels:
-                                    nonempty_count+=1 # this swap works.
-                                    parents.append(ss_same_len) # an equally valid parent entry
-                        # from above, there should be as many nonempties as entries (i.e. a&b&c iff a&b & a&c & b&c)
-                        if nonempty_count == n_labels: # require that every subgroup had a nonzero entry.        
-                            supergroup_labels = [l for k in [subgroup_labels, [j]] for l in k]
-                            hqv = self.get_reg_hqv(labels=supergroup_labels, logic='Intrs')
-                            top = (np.sum(hqv[...,-1]) > 0)
-                            vol = np.int32(np.sum(hqv))
-                            if vol > 0:
-                                iface_type = group_type(labels=supergroup_labels)
-                                #print('overlap found for labels (',supergroup_labels,', vol: ',vol,', top: ',top,', iface: ',iface_type,')')
-                                group_obj = Foo()
-                                setattr(group_obj, 'status', None)
-                                setattr(group_obj, 'labels', supergroup_labels)
-                                setattr(group_obj, 'volume', vol)
-                                setattr(group_obj, 'top',    top)
-                                setattr(group_obj, 'iface',  iface_type)
-                                setattr(group_obj, 'n_regs', n_regs)
-                                setattr(group_obj, 'children', [])
-                                setattr(group_obj, 'parents', sorted(parents))
-                                group_list.append(group_obj)
-                                # give each parent credit for the new group
-                                for parent in parents:
-                                    group_list[parent].children.append(len(group_list) - 1)
-                                new_groups = True
+            print('Group size:',n_regs)
+            for group in new_groups:
+                # it is assumed the labels are in monotonic order or they won't match the test templates.
+                for test_label in labels[np.nonzero(labels > max(group.labels))]: # next label to add to group
+                    test_group_labels = [group.labels, [test_label]] # this needs flattened
+                    test_group_labels = [el1 for el2 in test_group_labels for el1 in el2] # a bit opach, but it's just a double loop.
+                    test_group_labels.sort()
+                    #print('testing group', test_group_labels)
+                    # before we test the new group, make sure all of the parents have entries
+                    all_parents_exist=True
+                    parents = []
+                    for el in test_group_labels:
+                        test_parent_labels = test_group_labels.copy()
+                        test_parent_labels.remove(el)
+                        parent_idx, = np.nonzero([ (group.labels == test_parent_labels) for group in group_list])
+                        #print('checking parent:', test_parent_labels, 'at index:', parent_idx)
+                        if np.size(parent_idx) is 0:
+                            #print('no parent at index:', parent_idx)
+                            all_parents_exist=False
+                        else:
+                            #print('parent found at idx:', parent_idx)
+                            parents.append(parent_idx[0])
+                    #print('Parents exist:', all_parents_exist)
+                    #print('Parents at:', parents)
+                    if all_parents_exist: # if all the parent elements are present, there could be a child intersection:
+                        hqv = self.get_reg_hqv(labels=test_group_labels, logic='Intrs')
+                        top = (np.sum(hqv[...,-1]) > 0)
+                        vol = np.int32(np.sum(hqv))
+                        pole = (hqv[:,0,:].max() | hqv[:,-1,:].max())
+                        if vol > 0:
+                            clsd, opos, oneg = group_type(labels=test_group_labels)
+                            new_group_obj = Foo()
+                            setattr(new_group_obj, 'status',     'new')
+                            setattr(new_group_obj, 'labels',     test_group_labels)
+                            setattr(new_group_obj, 'volume',     vol)
+                            setattr(new_group_obj, 'top',        top)
+                            setattr(new_group_obj, 'pole',       pole)
+                            setattr(new_group_obj, 'opos',       opos)
+                            setattr(new_group_obj, 'oneg',       oneg)
+                            setattr(new_group_obj, 'clsd',       clsd)
+                            setattr(new_group_obj, 'iface',      None)
+                            setattr(new_group_obj, 'n_regs',     n_regs)
+                            setattr(new_group_obj, 'children',   [])
+                            setattr(new_group_obj, 'parents',    sorted(parents))
+                            group_list.append(new_group_obj)
+                            # give each parent credit for the new group
+                            for parent in parents:
+                                group_list[parent].children.append(np.size(group_list)-1)
+                group.status = 'clear'
+            # update list of new groups
+            new_groups=[group for group in group_list if (group.status is 'new')]
 
         print('Overlap group search complete')
         # now we'll add the result to the list of groups.
@@ -1292,8 +1371,11 @@ class Model(object):
         
         print('Success \n%%%%%%%%%%%%%%%%%%%%%%%%%%%%')
 
-        return group_list
-    
+        if return_list is not None:
+            if return_list:
+                return group_list
+        else:
+            return 0
         ########################
         # end of method ########
         ########################
@@ -1301,8 +1383,115 @@ class Model(object):
 
 
 
+    def inspect_intersections(self, group_name=None, open_only=None, return_list=None):
+        
+        ####################################################################################################
+        # this method loops through a supplied set of intersections and determines their individual type   #
+        ####################################################################################################
 
-    def find_detached_HQVs(self, labels=None, group_name=None):
+        import numpy as np
+        
+        if open_only is None: open_only = True
+        if group_name is None: group_name = 'open_regions'
+
+        try:
+            group_list = getattr(self.result.intersections, group_name)
+        except AttributeError:
+            print('must supply a valid intersection group name')
+            return -1
+
+        # at this stage we're only going to concern ourselves with interfaces in the open field.
+        open_group_list = [group for group in group_list if not group.clsd]
+        double_open_group_list = [group for group in open_group_list if (group.n_regs==2)]
+        larger_open_group_list = [group for group in open_group_list if (group.n_regs>=3)]
+
+        # some preliminary checks that apply to all groops
+        for group in group_list:
+            group.group_type=None
+            group.conn_HCS=None
+            group.conn_vtx=None
+            group.open_child=None
+            group.is_HCS = (group.opos & group.oneg)
+            group.is_OCB = ((group.opos | group.oneg) & group.clsd)
+            if (group.top and not group.is_HCS):
+                for child in group.children:
+                    if group_list[child].top:
+                        group.open_child=True
+                        if (group_list[child].oneg & group_list[child].opos):
+                            group.conn_HCS=True
+
+            
+        # and now interfaces of two regions, which may be layers are subsets if intersections
+        for group in double_open_group_list:
+            if (group.top and bool(group.is_HCS)):
+                print(group.labels,'is a group of 2 within the HCS')
+            if (group.top and not bool(group.is_HCS)):
+                # now we have to be a bit tricky to determine:
+                # 1) could it be an intersection of two domains within a larger intersection
+                # 2) if it has a child that is an intersection, is that child truly away from the HCS
+                coparent_labels=[]
+                group.conn_vtx=False
+                for child in group.children: # any child group is an intersection, but which type?
+                    if (group_list[child].top and not group_list[child].clsd): # must be open at top
+                        # here to address 1)
+                        if not (bool(group_list[child].is_HCS) | bool(group_list[child].conn_HCS)): # cannot have any association with HCS
+                            group.conn_vtx=True
+                        # here to address 2)
+                        # collect the coparents to determine degeneracy of a layer
+                        for coparent in group_list[child].parents:
+                            if not group_list[coparent].clsd:
+                                coparent_labels.append(group_list[coparent].labels)
+                # get the intersection element that shares all possible parent elements, if it exists
+                common_child = [el for el in open_group_list if (el.labels == list(np.unique(coparent_labels)))]
+                common_child_large_vertex = False
+                if np.size(common_child) == 1:
+                    if (np.size(common_child[0].labels) > 3) and (not bool(common_child[0].is_HCS)):
+                        common_child_large_vertex=True
+                # if exists: this layer is simply a subregion of a larger vertex structure, and not a true layer
+                # otherwise: this layer is a true layer, bounded by intersections, each of which supports its own child groups
+                if not group.iface:
+                    group.group_type='intersection'
+                    print(group.labels,'is not a true layer')
+                else:
+                    if group.conn_HCS:
+                        group.group_type='layer'
+                        if group.conn_vtx:
+                            print(group.labels,'is a branch layer at the HCS')
+                        else:
+                            print(group.labels,'is a simple layer at the HCS')
+                    else:
+                        if common_child_large_vertex:
+                            group.group_type='intersection'
+                            print(group.labels,'is an errorneous layer within a vertex')
+                        else:
+                            group.group_type='layer'
+                            if group.conn_vtx:
+                                print(group.labels,'is a branch layer away from the HCS')
+                            else:
+                                print(group.labels,'is a non-terminating layer -- check for anomalies')
+
+
+        # we'll inspect groups of 3 or more
+        for group in larger_open_group_list:
+            if (group.top and bool(group.is_HCS)):
+                print(group.labels,'is a group of 3 or more within the HCS')
+            # open region intersection occurs away from HCS
+            if (group.top and not bool(group.is_HCS)):
+                group.iface_type='intersection'
+                if group.conn_HCS:
+                    print(group.labels,'is a part of an intersection at the HCS')
+                else:
+                    print(group.labels,'is a part of an intersection away from the HCS')
+
+                
+        ########################
+        # end of method ########
+        ########################
+
+
+
+        
+    def find_detached_HQVs(self, labels=None, group_name=None, return_list=None):
         
         ####################################################################################################
         # this method checks domain hqvs agains all hqv intersections to look for non-overlapping sections #
@@ -1453,7 +1642,11 @@ class Model(object):
         
         print('Success \n%%%%%%%%%%%%%%%%%%%%%%%%%%%%')
 
-        return group_list
+        if return_list is not None:
+            if return_list:
+                return group_list
+        else:
+            return 0
     
         ########################
         # end of method ########
