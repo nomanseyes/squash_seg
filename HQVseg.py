@@ -146,8 +146,8 @@ class Result(object):
     ####################################################################
 
     def __init__(self, hqv_msk=None, GlnQp=None, reg_width=None, hqv_width=None, pad_msk=None, \
-                 vol_seg=None, seg_msk=None, adj_msk=None, intersections=None, detached_HQVs=None, \
-                 null_to_region_dist=None, null_to_detached_dist=None, \
+                 vol_seg=None, seg_msk=None, adj_msk=None, exterior_HQVs=None, interior_HQVs=None, \
+                 null_to_region_dist=None, null_to_intHQV_dist=None, null_info=None, \
                  open_labels=None, clsd_labels=None, opos_labels=None, oneg_labels=None, labels=None):
 
         # and here are the new attributes, which are masks, intiger arrays, and lists of strings indicating groupings.
@@ -175,10 +175,11 @@ class Result(object):
         self.adj_msk               = adj_msk
         self.adj_msk_shape         = None
         self.adj_msk_boolsize      = None
-        self.intersections         = intersections
-        self.detached_HQVs         = detached_HQVs
+        self.exterior_HQVs         = exterior_HQVs
+        self.interior_HQVs         = interior_HQVs
+        self.null_info             = null_info
         self.null_to_region_dist   = null_to_region_dist
-        self.null_to_detached_dist = null_to_detached_dist
+        self.null_to_intHQV_dist   = null_to_intHQV_dist
 
 
     ###########################
@@ -199,7 +200,7 @@ class Model(object):
     # attributes are the initializtion arguments, the model data, and the post-processing results.
     # methods of this class will act on these objects.
     
-    def __init__(self, model=None, inputs=None, source=None, result=None, auto_import=None, auto_segment=None, auto_group=None, do_all=None, auto_save=None):
+    def __init__(self, model=None, inputs=None, source=None, result=None, auto_import=None, auto_segment=None, auto_group=None, auto_inspect=None, do_all=None, auto_save=None):
 
         self.inputs=Inputs()
         self.source=Source()
@@ -256,16 +257,16 @@ class Model(object):
                 print('could not populate model.result')
 
         if do_all:
-            auto_import=True
-            auto_segment=True
-            auto_group=True
+            auto_import  =True
+            auto_segment =True
+            auto_group   =True
+            auto_inspect =True
 
-        if auto_import: self.do_import()
+        if auto_import:  self.do_import()
         if auto_segment: self.do_segment()
-        if auto_group: self.do_group()
-
-        if auto_save:
-            self.save_data()
+        if auto_group:   self.do_group()
+        if auto_inspect: self.do_inspect()
+        if auto_save:    self.save_data()
             
     def do_import(self):
         self.build_grid()
@@ -278,15 +279,20 @@ class Model(object):
 
     def do_group(self):
         self.determine_adjacency()
-        self.find_intersections()
-        self.find_detached_HQVs()
-        self.get_null_reg_dist()
-        self.get_null_dtch_dist()
+        self.find_exterior_HQVs()
+        self.find_interior_HQVs()
 
-    def do_all(self):
+    def do_inspect(self):
+        self.get_null_region_dist()
+        self.get_null_intHQV_dist()
+        self.associate_nulls()
+
+    def do_all(self, auto_save=None):
         self.do_import()
         self.do_segment()
         self.do_group()
+        self.do_inspect()
+        if auto_save: self.save_data()
 
         
         
@@ -668,10 +674,10 @@ class Model(object):
         # it's also useful to have the distance from the interior of the hqv regions to their boundary, and the other way.
         # now we do our distance transform and masking
         hqv_dist = ndi.distance_transform_edt(~hqv_msk).astype('float32') # distance to nearest hqv
-        reg_width = np.mean(4.*hqv_dist[np.nonzero(~hqv_msk)]).astype('float32') # full width is 4 times average distance to boundary
+        reg_width = 4.*np.mean(hqv_dist[np.nonzero(~hqv_msk)]).astype('float32') # full width is 4 times average distance to boundary
         print('Vol width: ',reg_width)
         reg_dist = ndi.distance_transform_edt(hqv_msk).astype('float32') # distance to nearest low q region
-        hqv_width = np.mean(4.*reg_dist[np.nonzero(hqv_msk)]).astype('float32') # full width is 4 times average distance to boundary
+        hqv_width = 4.*np.mean(reg_dist[np.nonzero(hqv_msk)]).astype('float32') # full width is 4 times average distance to boundary
         print('HQV width: ',hqv_width)
         del(reg_dist)
 
@@ -1161,7 +1167,7 @@ class Model(object):
             unroll_roll_dist_i = np.roll(roll_dist_i, -np.int(self.inputs.nph/2), axis=0)
             # and we combine both versions
             min_dist_i = np.minimum(dist_i, unroll_roll_dist_i)
-            self.result.adj_msk[...,i] = ( min_dist_i <= ( np.float32(self.inputs.adj_thrsh) * self.result.hqv_width * self.source.crr / self.source.crr.mean() ) )
+            self.result.adj_msk[...,i] = ( min_dist_i <= ( np.float32(self.inputs.adj_thrsh) * self.result.hqv_width * (self.source.crr / self.source.crr.mean())**2 ) )
             if self.result.labels[i]==self.result.clsd_labels.max():
                 print('Finished with Closed regions')
             if self.result.labels[i]==self.result.open_labels.max():
@@ -1203,18 +1209,19 @@ class Model(object):
                     return 
 
         if not logic:
-            logic='Union'
+            logic='Intersection'
 
         # note that the adjacency mask runs over non-zero entries to the label list.
-        msk = (np.ones(self.result.hqv_msk.shape, dtype='bool') * (logic=='Intrs'))
+        msk = (np.ones(self.result.hqv_msk.shape, dtype='bool') * (logic=='Intersection'))
         all_labels=self.result.labels
         for i in range(all_labels.size):
             if all_labels[i] in labels:
                 if logic=='Union':
                     msk = msk | self.result.adj_msk[...,i] # unions
-                elif logic=='Intrs':
+                elif logic=='Intersection':
                     msk = msk & self.result.adj_msk[...,i] # intersections
-                else: print('hqv_type must be one of "Intrs" or "Union"')
+                else: print('hqv_type must be one of "Intersection" or "Union"')
+                
         msk = msk & self.result.hqv_msk # project against hqv mask
 
         return msk
@@ -1227,37 +1234,72 @@ class Model(object):
         ########################
 
 
-    def find_intersections(self, labels=None, group_name=None, return_list=None):
+
+
+
+    def get_reg_bnd(self, labels=None, logic=None):
+        
+        ################################################################################################
+        # this method extracts the boundary associated with a group of domains given a specified logic #
+        ################################################################################################
+
+        import numpy as np
+        
+        if self.result.adj_msk is None:
+            print('adjacency mask not available')
+            return
+
+        if labels is None:
+             print('must supply label (or list of labels)')
+             return
+        else:
+            try:
+                labels=list(labels)
+            except TypeError:
+                if np.size(labels)==1: 
+                    labels=[labels]
+                else: 
+                    print('labels must be int or iterable type')
+                    return 
+
+        if not logic:
+            logic='Intersection'
+
+        # note that the adjacency mask runs over non-zero entries to the label list.
+        msk = (np.ones(self.result.hqv_msk.shape, dtype='bool') * (logic=='Intersection'))
+        all_labels=self.result.labels
+        for label in labels:
+            reg = self.result.vol_seg == label
+            bnd = get_mask_boundary(reg)
+            if logic=='Union':
+                msk = msk | bnd # unions
+            elif logic=='Intersection':
+                msk = msk & bnd # intersections
+            else: print('hqv_type must be one of "Intersection" or "Union"')
+
+        return msk
+        
+
+        ########################
+        # end of method ########
+        ########################
+
+
+    def find_exterior_HQVs(self, labels=None, return_list=None, omit_clsd_pairs=None):
         
         ###################################################################################################
         # this method builds a branch structure showing the various groups with non-trivial intersections #
         ###################################################################################################
 
         import numpy as np
+        from scipy import ndimage as ndi
 
         if labels is None:
-            labels=self.result.open_labels
-            if group_name is None: group_name='open_regions'
-        elif type(labels) is type(''):
-            if labels=='all':
-                labels=self.result.labels
-                if group_name is None: group_name='all_regions'
-            elif labels=='open':
-                labels=self.result.open_labels
-                if group_name is None: group_name='open_regions'
-            elif labels=='clsd':
-                labels=self.result.clsd_labels
-                if group_name is None: group_name='clsd_regions'
-            elif labels=='opos':
-                labels=self.result.opos_labels
-                if group_name is None: group_name='opos_regions'
-            elif labels=='oneg':
-                labels=self.result.oneg_labels
-                if group_name is None: group_name='oneg_regions'
-        elif type(labels)==type([]) or type(labels)==type(np.array(())):
-            labels=np.array(labels)
-            if group_name is None: group_name='custom_group'
+            labels=self.result.labels
 
+        if omit_clsd_pairs is None:
+            omit_clsd_pairs = True
+        
         def group_type(labels=None):
             clsd = np.max([(label in self.result.clsd_labels)     for label in labels])
             opos = np.max([(label in self.result.opos_labels)     for label in labels])
@@ -1267,88 +1309,126 @@ class Model(object):
         group_list = []
         # labels need to be monotonic as this is assumed below.
         labels.sort()
+        print('Inspecting ',np.size(labels),'regions in range ',labels[0],':',labels[-1])
 
         # first we append pairwise groupings
-        print('Determining overlapping regions pairs')
+        print('Testing for overlapping regions...')
+        if omit_clsd_pairs: print('                               ...skipping closed-only pairings')
         for l1 in labels:
             for l2 in labels[np.nonzero(labels>l1)]:
+                # by default we ignore clsd-clsd pairings.
                 group_labels = [l1,l2]
-                hqv = self.get_reg_hqv(labels=group_labels, logic='Intrs')
-                top = (np.sum(hqv[...,-1]) > 0)
-                vol = np.int32(np.sum(hqv))
-                pole = (hqv[:,0,:].max() | hqv[:,-1,:].max())
-                if vol > 0:
-                    clsd, opos, oneg = group_type(labels=group_labels)
-                    # here we must distinguish hqv intersections from genuine domain interface layers
-                    l1_bound_derivs = np.gradient(self.result.vol_seg==l1, axis=(0,1,2))
-                    l2_bound_derivs = np.gradient(self.result.vol_seg==l2, axis=(0,1,2))
-                    l1_bound = 0 < (l1_bound_derivs[0]**2 + l1_bound_derivs[1]**2 + l1_bound_derivs[2]**2)
-                    l2_bound = 0 < (l2_bound_derivs[0]**2 + l2_bound_derivs[1]**2 + l2_bound_derivs[2]**2)
-                    domain_interface = np.max(l1_bound & l2_bound) # only if the boundaries intersect is it a true interface
-                    del(l1_bound_derivs, l2_bound_derivs, l1_bound, l2_bound)
-                    new_group_obj = Foo()
-                    setattr(new_group_obj, 'status',     'new')
-                    setattr(new_group_obj, 'labels',     group_labels)
-                    setattr(new_group_obj, 'volume',     vol)
-                    setattr(new_group_obj, 'top',        top)
-                    setattr(new_group_obj, 'pole',       pole)
-                    setattr(new_group_obj, 'opos',       opos)
-                    setattr(new_group_obj, 'oneg',       oneg)
-                    setattr(new_group_obj, 'clsd',       clsd)
-                    setattr(new_group_obj, 'iface',      domain_interface)
-                    setattr(new_group_obj, 'n_regs',     2)
-                    setattr(new_group_obj, 'children',   [])
-                    setattr(new_group_obj, 'parents',    [])
-                    group_list.append(new_group_obj)
-                
+                clsd, opos, oneg = group_type(labels=group_labels)
+                skip_clsd_pair = ( clsd and ( not (opos|oneg) ) and omit_clsd_pairs )
+                if not skip_clsd_pair:
+                    print('                               ...testing pair:', group_labels, '          ',end='\r')
+                    hqv = self.get_reg_hqv(labels=group_labels)
+                    top = (np.sum(hqv[...,-1]) > 0)
+                    vol = np.int32(np.sum(hqv))
+                    pole = bool(hqv[:,0,:].max() | hqv[:,-1,:].max())
+                    if vol > 0:
+                        
+                        # in clsd-field layers we don't really care about iface distinction
+                        if clsd:
+                            reg_iface=None
+                        else:
+                            # here we must distinguish hqv intersections from genuine domain interface layers
+                            iface_mask = self.get_reg_bnd(labels = group_labels)
+                            reg_iface = np.max(iface_mask)
+                            
+                        # now we get the volume subdivision
+                        if reg_iface:
+                            # now get distance measure to this interface
+                            iface_dist = ndi.distance_transform_edt(~iface_mask)
+                            # and make a threshold 'sausage' volume.
+                            iface_ball = (iface_dist <= self.result.hqv_width)
+                            del(iface_dist)
+                            vol_frac = [np.float32(np.mean((self.result.vol_seg==label)[np.nonzero(iface_ball)])) for label in group_labels]
+                        else:
+                            vol_frac = [np.float32(np.mean((self.result.vol_seg==label)[np.nonzero(hqv       )])) for label in group_labels]
+
+                        new_group_obj = Foo()
+                        setattr(new_group_obj, 'status',     'new')
+                        setattr(new_group_obj, 'labels',     group_labels)
+                        setattr(new_group_obj, 'volume',     vol)
+                        setattr(new_group_obj, 'vol_frac',   vol_frac)
+                        setattr(new_group_obj, 'top',        top)
+                        setattr(new_group_obj, 'pole',       pole)
+                        setattr(new_group_obj, 'opos',       opos)
+                        setattr(new_group_obj, 'oneg',       oneg)
+                        setattr(new_group_obj, 'clsd',       clsd)
+                        setattr(new_group_obj, 'reg_iface',  reg_iface)
+                        setattr(new_group_obj, 'n_regs',     2)
+                        setattr(new_group_obj, 'children',   [])
+                        setattr(new_group_obj, 'parents',    [])
+                        group_list.append(new_group_obj)
+        print('                               ...testing pair:', group_labels, '          ')
+        print('                               ...finished')
         # now we explore depth with recursion
 
-        print('Determining higher order overlap groups')
+        print('Testing higher order groups...')
         n_regs=2
         new_groups=[group for group in group_list if (group.status is 'new')] # initialize number of groups to be explored.
         while new_groups:
             n_regs+=1
-            print('Group size:',n_regs)
-            for group in new_groups:
+            for parent_group in new_groups:
+                parent_group.status = 'clear'
                 # it is assumed the labels are in monotonic order or they won't match the test templates.
-                for test_label in labels[np.nonzero(labels > max(group.labels))]: # next label to add to group
-                    test_group_labels = [group.labels, [test_label]] # this needs flattened
-                    test_group_labels = [el1 for el2 in test_group_labels for el1 in el2] # a bit opach, but it's just a double loop.
-                    test_group_labels.sort()
-                    #print('testing group', test_group_labels)
+                test_labels = labels[np.nonzero(labels > max(parent_group.labels))]
+                for test_label in labels[np.nonzero(labels > max(parent_group.labels))]: # next label to add to group
+                    group_labels = [parent_group.labels, [test_label]] # this needs flattened
+                    group_labels = [el1 for el2 in group_labels for el1 in el2] # a bit opach, but it's just a double loop.
+                    group_labels.sort()
+                    clsd, opos, oneg = group_type(labels=group_labels)
+                    print('                           ...group size:',n_regs,', testing group:', group_labels, '                              ',end='\r' )
                     # before we test the new group, make sure all of the parents have entries
                     all_parents_exist=True
                     parents = []
-                    for el in test_group_labels:
-                        test_parent_labels = test_group_labels.copy()
-                        test_parent_labels.remove(el)
-                        parent_idx, = np.nonzero([ (group.labels == test_parent_labels) for group in group_list])
-                        #print('checking parent:', test_parent_labels, 'at index:', parent_idx)
-                        if np.size(parent_idx) is 0:
-                            #print('no parent at index:', parent_idx)
+                    for el in group_labels:
+                        coparent_labels = group_labels.copy()
+                        coparent_labels.remove(el)
+                        coparent_idx, = np.nonzero([ (group.labels == coparent_labels) for group in group_list])
+                        if np.size(coparent_idx) is 0:
                             all_parents_exist=False
                         else:
-                            #print('parent found at idx:', parent_idx)
-                            parents.append(parent_idx[0])
-                    #print('Parents exist:', all_parents_exist)
-                    #print('Parents at:', parents)
+                            parents.append(coparent_idx[0])
                     if all_parents_exist: # if all the parent elements are present, there could be a child intersection:
-                        hqv = self.get_reg_hqv(labels=test_group_labels, logic='Intrs')
+                        hqv = self.get_reg_hqv(labels=group_labels)
                         top = (np.sum(hqv[...,-1]) > 0)
                         vol = np.int32(np.sum(hqv))
                         pole = (hqv[:,0,:].max() | hqv[:,-1,:].max())
                         if vol > 0:
-                            clsd, opos, oneg = group_type(labels=test_group_labels)
+                            
+                            # in clsd-field layers we don't really care about iface distinction
+                            if clsd:
+                                reg_iface=None
+                            else:
+                                # here we must distinguish hqv intersections from genuine domain interface layers
+                                iface_mask = self.get_reg_bnd(labels = group_labels)
+                                reg_iface = np.max(iface_mask)
+                                
+                            # now we get the volume subdivision
+                            if reg_iface:
+                                # now get distance measure to this interface
+                                iface_dist = ndi.distance_transform_edt(~iface_mask)
+                                # threshold distance makes 'sausage' volume
+                                iface_ball = (iface_dist <= self.result.hqv_width)
+                                del(iface_dist)
+                                vol_frac = [np.float32(np.mean((self.result.vol_seg==label)[np.nonzero(iface_ball)])) for label in group_labels]
+                            else:
+                                vol_frac = [np.float32(np.mean((self.result.vol_seg==label)[np.nonzero(hqv       )])) for label in group_labels]
+                            
                             new_group_obj = Foo()
                             setattr(new_group_obj, 'status',     'new')
-                            setattr(new_group_obj, 'labels',     test_group_labels)
+                            setattr(new_group_obj, 'labels',     group_labels)
                             setattr(new_group_obj, 'volume',     vol)
+                            setattr(new_group_obj, 'vol_frac',   vol_frac)
                             setattr(new_group_obj, 'top',        top)
                             setattr(new_group_obj, 'pole',       pole)
                             setattr(new_group_obj, 'opos',       opos)
                             setattr(new_group_obj, 'oneg',       oneg)
                             setattr(new_group_obj, 'clsd',       clsd)
-                            setattr(new_group_obj, 'iface',      None)
+                            setattr(new_group_obj, 'reg_iface',  reg_iface)
                             setattr(new_group_obj, 'n_regs',     n_regs)
                             setattr(new_group_obj, 'children',   [])
                             setattr(new_group_obj, 'parents',    sorted(parents))
@@ -1356,142 +1436,120 @@ class Model(object):
                             # give each parent credit for the new group
                             for parent in parents:
                                 group_list[parent].children.append(np.size(group_list)-1)
-                group.status = 'clear'
-            # update list of new groups
+                            
             new_groups=[group for group in group_list if (group.status is 'new')]
+        print('                           ...group size:',n_regs,', testing group:', group_labels, '                              ')
+        print('                           ...finished')
 
-        print('Overlap group search complete')
+        print('Exterior HQV search complete')
         # now we'll add the result to the list of groups.
-        if self.result.intersections is None: self.result.intersections=Foo()
-        if hasattr(self.result.intersections, group_name):
-            print('Overwriting previous entry for group:',group_name)
-        else:
-            print('Populating new entry for group:',group_name)
-        setattr(self.result.intersections, group_name, group_list)
+        if self.result.exterior_HQVs is not None: print('Overwriting previous entry')
+
+        setattr(self.result, 'exterior_HQVs', group_list)
         
         print('Success \n%%%%%%%%%%%%%%%%%%%%%%%%%%%%')
 
-        if return_list is not None:
-            if return_list:
-                return group_list
-        else:
-            return 0
+        # might as well tag them now
+        self.tag_exterior_HQVs()
+
+        if return_list: return group_list
+        
         ########################
         # end of method ########
         ########################
 
 
-
-
-    def inspect_intersections(self, group_name=None, open_only=None, return_list=None):
-        
-        ####################################################################################################
-        # this method loops through a supplied set of intersections and determines their individual type   #
-        ####################################################################################################
+    def tag_exterior_HQVs(self, return_list=None):
 
         import numpy as np
+
+        group_list = self.result.exterior_HQVs
         
-        if open_only is None: open_only = True
-        if group_name is None: group_name = 'open_regions'
+        print('Inspecting exterior HQVs')
+ 
+        #things that we want to know:
+        #1 for n=2, is it a layer, or is it just a part of a vertex?
+        #2 for n=2, if it is a layer: is it a branch, is it a simple layer, or is it w/in the HCS
+        #3 for n>2, is it in the HCS or not? this does not depend on inherited information
+        #3 for n>2, if not in HCS, is it a vertex? or is it just a merger? this also does not depend on inherited information.
 
-        try:
-            group_list = getattr(self.result.intersections, group_name)
-        except AttributeError:
-            print('must supply a valid intersection group name')
-            return -1
+        #strategy: vertices don't care whether their parents are branches/layers/etc. So we should work fron large n to small n
 
-        # at this stage we're only going to concern ourselves with interfaces in the open field.
-        open_group_list = [group for group in group_list if not group.clsd]
-        double_open_group_list = [group for group in open_group_list if (group.n_regs==2)]
-        larger_open_group_list = [group for group in open_group_list if (group.n_regs>=3)]
-
-        # some preliminary checks that apply to all groops
+        # first the things that depend on parents, increasing order
         for group in group_list:
-            group.group_type=None
-            group.conn_HCS=None
-            group.conn_vtx=None
-            group.open_child=None
-            group.is_HCS = (group.opos & group.oneg)
-            group.is_OCB = ((group.opos | group.oneg) & group.clsd)
-            if (group.top and not group.is_HCS):
-                for child in group.children:
-                    if group_list[child].top:
-                        group.open_child=True
-                        if (group_list[child].oneg & group_list[child].opos):
-                            group.conn_HCS=True
+            group.conn_HCS=None # connects to HCS
+            group.part_HCS=(group.top & group.opos & group.oneg) # part of HCS
+            group.conn_OCB=None # connects to OCB
+            group.part_OCB=(group.clsd & (group.opos | group.oneg)) # part of OCB
+            group.conn_vtx=None # connects to vertex
+            group.part_vtx=None # part of vertex -- in case of n=2, this implies vtx-only layer
+            group.part_mgr=None
+            group.conn_mgr=None
+            group.merger  =None # like a vertex but too accute
+            group.accute  =None # deals with opening angle in triplets
+            group.simple  =None # boolean if simple layer
+            group.branch  =None # boolean if branch layer
+            group.cochild =None # index for cochild
+            group.open_child=None # if has child with imprint at top boundary
+            if (group.n_regs == 3):
+                group.accute = bool( ( np.min(group.vol_frac) < 0.1) | ( np.min(group.vol_frac) < np.max(group.vol_frac)/6 ) )
+                group.part_vtx = group.reg_iface and group.top and (not group.part_HCS) and (not group.accute)
+                group.part_mgr = group.reg_iface and group.top and (not group.part_HCS) and group.accute
+                #print(group.labels,'vertex accusement pass:', group.part_vtx)
+            if (group.n_regs >= 4):
+                parent_vtx_rat = np.mean([bool(group_list[parent].part_vtx) for parent in group.parents])
+                group.part_vtx = (parent_vtx_rat >= 0.5) and group.top and (not group.part_HCS)
+                #print(group.labels,'parent vertex accuteness pass:', group.part_vtx)
 
+        # next, the things the depend on children, in decreasing order:
+        for group in group_list[::-1]: # loop through backwards
             
-        # and now interfaces of two regions, which may be layers are subsets if intersections
-        for group in double_open_group_list:
-            if (group.top and bool(group.is_HCS)):
-                print(group.labels,'is a group of 2 within the HCS')
-            if (group.top and not bool(group.is_HCS)):
-                # now we have to be a bit tricky to determine:
-                # 1) could it be an intersection of two domains within a larger intersection
-                # 2) if it has a child that is an intersection, is that child truly away from the HCS
-                coparent_labels=[]
-                group.conn_vtx=False
-                for child in group.children: # any child group is an intersection, but which type?
-                    if (group_list[child].top and not group_list[child].clsd): # must be open at top
-                        # here to address 1)
-                        if not (bool(group_list[child].is_HCS) | bool(group_list[child].conn_HCS)): # cannot have any association with HCS
-                            group.conn_vtx=True
-                        # here to address 2)
-                        # collect the coparents to determine degeneracy of a layer
-                        for coparent in group_list[child].parents:
-                            if not group_list[coparent].clsd:
-                                coparent_labels.append(group_list[coparent].labels)
-                # get the intersection element that shares all possible parent elements, if it exists
-                common_child = [el for el in open_group_list if (el.labels == list(np.unique(coparent_labels)))]
-                common_child_large_vertex = False
-                if np.size(common_child) == 1:
-                    if (np.size(common_child[0].labels) > 3) and (not bool(common_child[0].is_HCS)):
-                        common_child_large_vertex=True
-                # if exists: this layer is simply a subregion of a larger vertex structure, and not a true layer
-                # otherwise: this layer is a true layer, bounded by intersections, each of which supports its own child groups
-                if not group.iface:
-                    group.group_type='intersection'
-                    print(group.labels,'is not a true layer')
-                else:
-                    if group.conn_HCS:
-                        group.group_type='layer'
-                        if group.conn_vtx:
-                            print(group.labels,'is a branch layer at the HCS')
-                        else:
-                            print(group.labels,'is a simple layer at the HCS')
-                    else:
-                        if common_child_large_vertex:
-                            group.group_type='intersection'
-                            print(group.labels,'is an errorneous layer within a vertex')
-                        else:
-                            group.group_type='layer'
-                            if group.conn_vtx:
-                                print(group.labels,'is a branch layer away from the HCS')
-                            else:
-                                print(group.labels,'is a non-terminating layer -- check for anomalies')
+            coparent_labels = [] # this will be populated later
+            for child in group.children:
+                # basic inherited traits
+                if (not group_list[child].clsd):
+                    group.open_child=True
+                if group_list[child].part_mgr:
+                    group.conn_mgr=True
+                if group_list[child].part_HCS:
+                    group.conn_HCS=True
+                if group_list[child].part_OCB:
+                    group.conn_OCB=True
+                if group_list[child].part_vtx:
+                    group.conn_vtx=True
+                # advanced coparent information
+                if (group.n_regs==2):
+                    for coparent in group_list[child].parents:
+                        if not group_list[coparent].clsd:
+                            coparent_labels.append(group_list[coparent].labels)
+            # now we determine which structures are part of vertices
+            # is there a child element whose parent labels exactly matches the list of all parents for all children of the current group
+            # if so, then the current group exists only within a it's collective child groups
+            # otherwise there would be multiple child branches, that would not overlap
+            if (group.n_regs==2):
+                try:
+                    cochild = [el for el in group_list if ((el.labels == list(np.unique(coparent_labels))) and (el.n_regs > group.n_regs) and not el.clsd)][0]
+                    group.cochild = np.nonzero([(cochild == el) for el in group_list])[0][0]
+                    if group.top and cochild.top and (not group.part_HCS) and (not cochild.part_HCS):
+                        group.part_vtx = cochild.part_vtx
+                except IndexError:
+                    pass
+                group.branch = group.top and group.reg_iface and group.conn_vtx and (not group.part_vtx) and (not group.part_HCS)
+                group.simple = group.top and group.reg_iface and (not group.conn_vtx) and (not group.part_vtx) and group.conn_HCS and (not group.part_HCS)
+                                
+        setattr(self.result, 'exterior_HQVs', group_list)
+        
+        print('Success \n%%%%%%%%%%%%%%%%%%%%%%%%%%%%')
 
-
-        # we'll inspect groups of 3 or more
-        for group in larger_open_group_list:
-            if (group.top and bool(group.is_HCS)):
-                print(group.labels,'is a group of 3 or more within the HCS')
-            # open region intersection occurs away from HCS
-            if (group.top and not bool(group.is_HCS)):
-                group.iface_type='intersection'
-                if group.conn_HCS:
-                    print(group.labels,'is a part of an intersection at the HCS')
-                else:
-                    print(group.labels,'is a part of an intersection away from the HCS')
-
-                
+        if return_list: return group_list
+        
         ########################
         # end of method ########
         ########################
-
-
+    
 
         
-    def find_detached_HQVs(self, labels=None, group_name=None, return_list=None):
+    def find_interior_HQVs(self, return_list=None):
         
         ####################################################################################################
         # this method checks domain hqvs agains all hqv intersections to look for non-overlapping sections #
@@ -1502,28 +1560,7 @@ class Model(object):
         import skimage.measure as skim
         from skimage import morphology as mor
 
-        if labels is None:
-            labels=self.result.open_labels
-            if group_name is None: group_name='open_regions'
-        elif type(labels) is type(''):
-            if labels=='all':
-                labels=self.result.labels
-                if group_name is None: group_name='all_regions'
-            elif labels=='open':
-                labels=self.result.open_labels
-                if group_name is None: group_name='open_regions'
-            elif labels=='clsd':
-                labels=self.result.clsd_labels
-                if group_name is None: group_name='clsd_regions'
-            elif labels=='opos':
-                labels=self.result.opos_labels
-                if group_name is None: group_name='opos_regions'
-            elif labels=='oneg':
-                labels=[el for el in self.result.open_labels if el not in self.result.opos_labels]
-                if group_name is None: group_name='oneg_regions'
-        elif type(labels)==type([]) or type(labels)==type(np.array(())):
-            labels=np.array(labels)
-            if group_name is None: group_name='custom_group'
+        labels=self.result.open_labels
         
         group_list=[]
 
@@ -1554,7 +1591,7 @@ class Model(object):
             if np.sum(reg_dtc) > hqv_vol:
                 print('found detached hqv in excess of typical hqv volume for region',reg)
                 dist_to_ifc = ndi.distance_transform_edt(~reg_ifc & (vol_seg==reg) )
-                print('computed distances to interface')
+                #print('computed distances to interface')
                 msk = (reg_dtc & (dist_to_ifc > self.result.hqv_width))
                 msk = mor.closing(mor.opening(msk)) & ~reg_ifc
                 if np.sum(msk)==0:
@@ -1568,7 +1605,7 @@ class Model(object):
 
                     # remove small objects
                     
-                    print(sublabels.size,'unique contiguous features found -- filtering')
+                    #print(sublabels.size,'unique contiguous features found -- filtering')
                     for sublabel in sublabels:
                         msk = (subvols == sublabel)
                         msk_ind = np.where(subvols==sublabel)
@@ -1580,18 +1617,17 @@ class Model(object):
 
                     old_sublabels = (np.unique(subvols[np.where(subvols!=0)]))
                     # test to see if there's anything to work with.
-                    print(old_sublabels.size, 'unique contiguous feature(s) remain')
+                    #print(old_sublabels.size, 'unique contiguous feature(s) remain')
                     if old_sublabels.size == 0: # only if something left to do...
                         print('no significant features remain after filter')
                     else:
                         # surviving regions are grown back into mask
-                        print('calculating distance to new features')
+                        #print('calculating distance to new features')
                         dist_to_reg = ndi.distance_transform_edt(subvols==0)
-                        print('growing features within threshold distance')
-                        reg_dtc_derivs = np.gradient(reg_dtc, axis=(0,1,2))
-                        reg_dtc_overlap = (np.sqrt(reg_dtc_derivs[0]**2 + reg_dtc_derivs[1]**2 + reg_dtc_derivs[2]**2)!=0) & reg_ifc
+                        #print('growing features within threshold distance')
+                        reg_dtc_overlap = get_mask_boundary(reg_dtc) & reg_ifc
                         subvols=mor.watershed(dist_to_reg, subvols, mask=((reg_dtc | reg_dtc_overlap) & ~badregs & (dist_to_reg < 2.0*self.result.hqv_width)))
-                        del(reg_dtc_derivs, dist_to_reg)
+                        del(dist_to_reg)
                         # inclusion of the distance threshold limits growth along surface of ifc to keep structure compact.
                         # now we reduce if global
                         if self.inputs.glbl_mdl:
@@ -1602,6 +1638,7 @@ class Model(object):
                             reg_ifc = self.global_reduce(reg_ifc)
                             reg_dtc = self.global_reduce(reg_dtc)
                             reg_dtc_overlap = self.global_reduce(reg_dtc_overlap)
+                            #print('associating labels for periodicity')
                             self.associate_labels(subvols, axis=0, use_boundary=True)
                         # renumber to remove missing entries
                         old_sublabels = (np.unique(subvols[np.where(subvols!=0)])) 
@@ -1612,48 +1649,37 @@ class Model(object):
                             subvols[ss] = i+1
                         del(swapped, old_sublabels)
                         # now test overlap with other domains to see if fully detached or polar
-                        fully_detached = []
-                        pole_artefact = []
                         sublabels = np.unique(subvols[np.nonzero(subvols)])
+                        print(np.size(sublabels),'unique features remain after filtering')
                         for i in range(sublabels.size):
-                            fully_detached.append(False)
-                            pole_artefact.append(False)
                             submask = (subvols==sublabels[i])
-                            if ( submask & reg_dtc_overlap ).max() == 0: fully_detached[i]=True
-                            if ( submask[:,0,:].max() == 1 ) | ( submask[:,-1,:].max() == 1 ): pole_artefact[i]=True
+                            fully_detached = ( ( submask & reg_dtc_overlap ).max() == 0 ) 
+                            polar_artefact = ( ( submask[:,0,:].max() == 1 ) | ( submask[:,-1,:].max() == 1 ) )
+                            hqv_obj = Foo()
+                            setattr(hqv_obj, 'label', reg)
+                            setattr(hqv_obj, 'sublabel', sublabels[i])
+                            setattr(hqv_obj, 'hqv_msk', submask)
+                            setattr(hqv_obj, 'fully_detached', fully_detached)
+                            setattr(hqv_obj, 'polar_artefact', polar_artefact)
+                            group_list.append(hqv_obj)
 
-                        dtc_obj = Foo()
-                        setattr(dtc_obj, 'region', reg)
-                        setattr(dtc_obj, 'subvol', subvols)
-                        setattr(dtc_obj, 'sublabels', np.unique(subvols[np.nonzero(subvols)]))
-                        setattr(dtc_obj, 'fully_detached', fully_detached)
-                        setattr(dtc_obj, 'pole_artefact', pole_artefact)
-                        group_list.append(dtc_obj)
 
-
-        print('Detached HQV search complete')
+        print('Interior HQV search complete')
         # now we'll add the result to the list of groups.
-        if self.result.detached_HQVs is None: self.result.detached_HQVs=Foo()
-        if hasattr(self.result.detached_HQVs, group_name):
-            print('Overwriting previous entry for group: ',group_name)
-        else:
-            print('Populating new entry for group: ',group_name)
-        setattr(self.result.detached_HQVs, group_name, group_list)
+        if self.result.interior_HQVs is not None:
+            print('Overwriting previous entry')
+
+        setattr(self.result, 'interior_HQVs', group_list)
         
         print('Success \n%%%%%%%%%%%%%%%%%%%%%%%%%%%%')
 
-        if return_list is not None:
-            if return_list:
-                return group_list
-        else:
-            return 0
+        if return_list: return group_list
     
         ########################
         # end of method ########
         ########################
 
 
-        
 
     def make_null_box(self, null_num=None, box_size=None):
 
@@ -1704,7 +1730,7 @@ class Model(object):
 
 
 
-    def get_null_reg_dist(self, labels=None, null_list=None):
+    def get_null_region_dist(self):
 
         #################################################################################################
         # this method gets the distnaces from each null to each domain, in the form of a pair of arrays #
@@ -1714,24 +1740,19 @@ class Model(object):
 
         print('finding distances from nulls to discrete domains')
 
-        if labels is None:
-            print('region list not supplied -- selecting all')
+        try:
             labels = self.result.labels
-            labelname='all_regions'
+        except AttributeError:
+            'cannot retrieve label list'
+            return -1
 
         null_locs = self.source.null_locs
         N_null=null_locs.shape[1]
-
-        if null_list is None:
-            print('null list not supplied -- selecting all')
-            null_list=np.arange(N_null)
-            nullname='all_nulls'
         
-        int_distance = np.zeros((np.size(null_list), np.size(labels))).astype('float32')
-        hqv_distance = np.zeros((np.size(null_list), np.size(labels))).astype('float32')
+        int_distance = np.zeros((N_null, np.size(labels))).astype('float32')
+        hqv_distance = np.zeros((N_null, np.size(labels))).astype('float32')
 
-        for j in range(np.size(null_list)):
-            n = null_list[j]
+        for n in range(N_null):
             box = np.array(self.make_null_box(null_num=n, box_size=2)).T
             box_indices = (box[0], box[1], box[2])
             # we'll do measurements in sphericals but assuming orthonormality -- this is innacurate for large distances but we only care about small distances.
@@ -1741,40 +1762,38 @@ class Model(object):
             dist_ph = self.source.crr*np.cos(self.source.cth*np.pi/180)*(np.pi/180) * (self.source.cph - self.source.null_locs.T[n,0]) / self.source.metph
             dist_mm = np.sqrt(dist_rr**2 + dist_th**2 + dist_ph**2)
             del dist_rr, dist_th, dist_ph
-            print('finding distances to null:',n)
+            print('finding distances to null:',n,'            ',end='\r')
             for i in range(np.size(labels)):
                 # have to get the mask for the region hqv
                 hqv_msk = self.get_reg_hqv(labels=labels[i])
                 # test the typical hqv mask at the null box
                 hqv_box_dist = np.mean(~hqv_msk[box_indices])
                 if (hqv_box_dist < 0.5): # mostly inside domain.
-                    hqv_distance[j,i] = hqv_box_dist
+                    hqv_distance[n,i] = hqv_box_dist
                 else:
-                    hqv_distance[j,i] = max(0.5, dist_mm[np.nonzero(hqv_msk)].min())
+                    hqv_distance[n,i] = max(0.5, dist_mm[np.nonzero(hqv_msk)].min())
                 int_msk = (self.result.vol_seg == labels[i])
                 # test the typical int msk at the null box
                 int_box_dist = np.mean(~int_msk[box_indices])
                 if (int_box_dist < 0.5):
-                    int_distance[j,i] = int_box_dist
+                    int_distance[n,i] = int_box_dist
                 else:
-                    int_distance[j,i] = max(0.5, dist_mm[np.nonzero(int_msk)].min())
+                    int_distance[n,i] = max(0.5, dist_mm[np.nonzero(int_msk)].min())
                 # with these conventions, the distance can go to zero, even if the null is not centered on a given pixel.
                 #print('region: '+str(labels[i])+', null: '+str(n)+', hqv distance: '+str(hqv_distance[i,j])+', int distance:'+str(int_distance[i,j]))
+        print('finding distances to null:',n,'            ')
 
         dist_object = Foo()
-        setattr(dist_object, 'regions', np.int32(labels))
-        setattr(dist_object, 'nulls', np.int32(null_list))
+        setattr(dist_object, 'labels', np.int32(labels))
+        setattr(dist_object, 'nulls', np.int32(np.arange(N_null)))
         setattr(dist_object, 'int_distance', np.float32(int_distance))
         setattr(dist_object, 'hqv_distance', np.float32(hqv_distance))
 
-        if self.result.null_to_region_dist is None:
-            self.result.null_to_region_dist = Foo()
-
         try:
-            setattr(self.result.null_to_region_dist, labelname+'_'+nullname, dist_object)
+            setattr(self.result, 'null_to_region_dist', dist_object)
         except AttributeError:
             print('cannot set attribute of null_to_region_dist')
-            return
+            return -1
 
         return dist_object
         
@@ -1788,7 +1807,7 @@ class Model(object):
         ########################
 
 
-    def get_null_dtch_dist(self, groupname=None, null_list=None):
+    def get_null_intHQV_dist(self):
 
         ############################################################################################################
         # this method gets the distnaces from each null to each detached segment, in the form of a list of objects #
@@ -1797,28 +1816,14 @@ class Model(object):
         import numpy as np
 
         print('finding distances from nulls to detached HQVs')
-        
-        if groupname is None:
-            print('group not supplied -- selecting open')
-            groupname = 'open_regions'
-
-        if not hasattr(self.result.detached_HQVs, groupname):
-            print(groupname,'not defined for list of detached HQVs')
-            return
 
         null_locs = self.source.null_locs
         N_null=null_locs.shape[1]
-
-        if null_list is None:
-            print('null list not supplied -- selecting all')
-            null_list=np.arange(N_null)
-            nullname='all_nulls'
         
         hqv_distance = []
 
-        for j in range(np.size(null_list)):
+        for n in range(N_null):
             hqv_distance.append([])
-            n = null_list[j]
             box = np.array(self.make_null_box(null_num=n, box_size=2)).T
             box_indices = (box[0], box[1], box[2])
             # we'll do measurements in sphericals but assuming orthonormality -- this is innacurate for large distances but we only care about small distances.
@@ -1828,39 +1833,33 @@ class Model(object):
             dist_ph = self.source.crr*np.cos(self.source.cth*np.pi/180)*(np.pi/180) * (self.source.cph - self.source.null_locs.T[n,0]) / self.source.metph
             dist_mm = np.sqrt(dist_rr**2 + dist_th**2 + dist_ph**2)
             del dist_rr, dist_th, dist_ph
-            print('finding distances to null:',n)
-            domain_axis=[]
+            print('finding distances to null:',n,'            ', end='\r')
+            label_axis=[]
             sublabel_axis=[]
-            for obj in getattr(self.result.detached_HQVs,groupname):
+            for obj in self.result.interior_HQVs:
                 # have to get the detached hqvs in the region, if any
-                print('testing detached segments in region',obj.region)
-                for sublabel in obj.sublabels:
-                    print('checking distance to subregion',obj.region,':',sublabel)
-                    domain_axis.append(obj.region)
-                    sublabel_axis.append(sublabel)
-                    # have to get the mask for the detached segment
-                    hqv_msk = (obj.subvol==sublabel)
-                    # test the typical hqv mask at the null box
-                    hqv_box_dist = np.mean(~hqv_msk[box_indices])
-                    if (hqv_box_dist < 0.5): # mostly inside domain.
-                        hqv_distance[j].append(hqv_box_dist)
-                    else:
-                        hqv_distance[j].append(max(0.5, dist_mm[np.nonzero(hqv_msk)].min()))
-
+                # print('checking distance to subregion',obj.region,':',sublabel)
+                label_axis.append(obj.label)
+                sublabel_axis.append(obj.sublabel)
+                # test the hqv mask at the null box
+                hqv_box_dist = np.mean(~obj.hqv_msk[box_indices])
+                if (hqv_box_dist < 0.5): # mostly inside domain.
+                    hqv_distance[n].append(hqv_box_dist)
+                else:
+                    hqv_distance[n].append(max(0.5, dist_mm[np.nonzero(obj.hqv_msk)].min()))
+                # print('distance to null:', hqv_distance[j][-1])
+        print('finding distances to null:',n,'            ')
         dist_object = Foo()
-        setattr(dist_object, 'regions', np.int32(domain_axis))
-        setattr(dist_object, 'subregions', np.int32(sublabel_axis))
-        setattr(dist_object, 'nulls', np.int32(null_list))
+        setattr(dist_object, 'labels', np.int32(label_axis))
+        setattr(dist_object, 'sublabels', np.int32(sublabel_axis))
+        setattr(dist_object, 'nulls', np.int32(np.arange(N_null)))
         setattr(dist_object, 'hqv_distance', np.array(hqv_distance, dtype='float32'))
 
-        if self.result.null_to_detached_dist is None:
-            self.result.null_to_detached_dist = Foo()
-
         try:
-            setattr(self.result.null_to_detached_dist, groupname+'_'+nullname, dist_object)
+            setattr(self.result, 'null_to_intHQV_dist', dist_object)
         except AttributeError:
             print('cannot set attribute of null_to_region_dist')
-            return
+            return -1
 
         print('Success \n%%%%%%%%%%%%%%%%%%%%%%%%%%%%')
         
@@ -1900,46 +1899,92 @@ class Model(object):
         ########################
 
 
-    def get_adj_nll(labels=None, logic=None):
+
+
+        
+
+    def associate_nulls(self):
 
         import numpy as np
+
+        # now we'll loop through intersection groups
+        print('associating nulls to exterior HQVs')
+        for hqv_obj in self.result.exterior_HQVs:
+            associated_nulls = []
+            for ni in self.result.null_to_region_dist.nulls:
+                hqv_dist_list = []
+                reg_dist_list = []
+                for label in hqv_obj.labels:
+                    ri, = np.nonzero(label == self.result.null_to_region_dist.labels)
+                    hqv_dist_list.append(self.result.null_to_region_dist.hqv_distance[ni,ri])
+                    reg_dist_list.append(self.result.null_to_region_dist.int_distance[ni,ri])
+                hqv_dist = np.sqrt(np.mean(np.array(hqv_dist_list)**2))
+                reg_dist = np.sqrt(np.mean(np.array(reg_dist_list)**2))
+                if np.min([hqv_dist, reg_dist]) <= self.result.hqv_width:
+                    # print('associating null',ni,'exterior HQV',hqv_obj.labels,'at distance',hqv_dist,'                        ',end='\r')
+                    temp_obj = Foo()
+                    setattr(temp_obj, 'null', ni)
+                    setattr(temp_obj, 'labels', hqv_obj.labels)
+                    setattr(temp_obj, 'hqv_dist', hqv_dist)
+                    setattr(temp_obj, 'reg_dist', reg_dist)
+                    associated_nulls.append(temp_obj)
+            # print('associating null',ni,'exterior HQV',hqv_obj.labels,'at distance',hqv_dist,'                        ')
+            setattr(hqv_obj, 'associated_nulls', associated_nulls)
+
+        # now we'll loop through detached HQVs
+        print('associating nulls to interior HQVs')
+        for hqv_obj in self.result.interior_HQVs:
+            associated_nulls=[]
+            # need to loop over the subregions for this specific region
+            ri, = np.nonzero((hqv_obj.sublabel == self.result.null_to_intHQV_dist.sublabels) & (hqv_obj.label == self.result.null_to_intHQV_dist.labels))
+            for ni in self.result.null_to_intHQV_dist.nulls:
+                hqv_dist = np.mean(self.result.null_to_intHQV_dist.hqv_distance[ni,ri])
+                if hqv_dist <= self.result.hqv_width:
+                    # print('associating null',ni,'with interior HQV',hqv_obj.label,':',hqv_obj.sublabel,'at distance',hqv_dist,'                        ',end='\r')
+                    temp_obj = Foo()
+                    setattr(temp_obj, 'null', ni)
+                    setattr(temp_obj, 'label', hqv_obj.label)
+                    setattr(temp_obj, 'sublabel', hqv_obj.sublabel)
+                    setattr(temp_obj, 'hqv_dist', hqv_dist)
+                    associated_nulls.append(temp_obj)
+            # print('associating null',ni,'with interior HQV',hqv_obj.label,':',hqv_obj.sublabel,'at distance',hqv_dist,'                        ')
+            setattr(hqv_obj, 'associated_nulls', associated_nulls)
+
+        # finally, we'll tabulate a list of information organized by null number
+
+        null_info = []
+
+        print('tabulating associations by null index')
         
-        ###############################################################################
-        # this method gets the nulls adjacent to a given domain (not used at present) #
-        ###############################################################################
+        for n in range(self.source.null_locs.shape[1]):
+            null_box = self.make_null_box(null_num=n, box_size=2)
+            labels = list(np.unique([self.result.vol_seg[loc] for loc in null_box]))
+            associated_extHQVs = []
+            associated_intHQVs = []
+            for hqv_obj in self.result.exterior_HQVs:
+                for null_obj in hqv_obj.associated_nulls:
+                    if (null_obj.null == n): associated_extHQVs.append(hqv_obj)
+            for hqv_obj in self.result.interior_HQVs:
+                for null_obj in hqv_obj.associated_nulls:
+                    if (null_obj.null == n): associated_intHQVs.append(hqv_obj)
+            
+            null_info_obj = Foo()
+            setattr(null_info_obj, 'null', n)
+            setattr(null_info_obj, 'null_loc', self.source.null_locs[:,n])
+            setattr(null_info_obj, 'labels', labels)
+            setattr(null_info_obj, 'extHQVs', associated_extHQVs)
+            setattr(null_info_obj, 'intHQVs', associated_intHQVs)
+            null_info.append(null_info_obj)
+
+        setattr(self.result, 'null_info', null_info)
+
+
+        print('success...')
         
-        hqv_msk = self.get_reg_hqv(labels=labels, logic=logic)
-
-        # get nulls
-        null_locs=self.result.null_locs.T
-        N_null=null_locs.shape[0]
-
-        # find overlap
-        adj_nll_list=[]
-        for n in range(N_null):
-            nll_box = self.make_null_box(null_num=n, box_size=2)
-            if np.sum(hqv_msk[coords] for coords in nll_box) > 0:
-                adj_nll_list.append(labels, logic, n)
-
-        return adj_nll_list
 
         ########################
         # end of method ########
         ########################
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 
 
 
@@ -2618,6 +2663,22 @@ def portattr(target_object, name, attribute):
             #print('Attribute', name, 'set statically.')
         except AttributeError:
             print('Attribute', name, 'cannot be set.')
+
+
+
+
+
+            
+def get_mask_boundary(mask):
+    
+    # small routine to get the 2-pixel band that surrounds a discontinuity in a mask
+        
+    import numpy as np
+    from scipy.ndimage import morphology as mor
+
+    boundary = (~mask & mor.binary_dilation(mask, border_value=0) | (mask & ~mor.binary_erosion(mask, border_value=1)))
+
+    return boundary
 
 
 
