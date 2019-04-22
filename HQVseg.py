@@ -1121,7 +1121,7 @@ class Model(object):
                         label_array[np.nonzero(i_msk)] = label_subset[j]
                         swapped=True
                         
-        print('completed in',np.int32(time.time()-stime),'seconds')
+        print('label re-assignment completed in',np.int32(time.time()-stime),'seconds')
 
         if in_place:
             return 0
@@ -1317,10 +1317,10 @@ class Model(object):
         for l1 in labels:
             for l2 in labels[np.nonzero(labels>l1)]:
                 # by default we ignore clsd-clsd pairings.
-                group_labels = [l1,l2]
-                clsd, opos, oneg = group_type(labels=group_labels)
+                clsd, opos, oneg = group_type(labels=[l1,l2])
                 skip_clsd_pair = ( clsd and ( not (opos|oneg) ) and omit_clsd_pairs )
                 if not skip_clsd_pair:
+                    group_labels = [l1,l2]
                     print('                               ...testing pair:', group_labels, '          ',end='\r')
                     hqv = self.get_reg_hqv(labels=group_labels)
                     top = (np.sum(hqv[...,-1]) > 0)
@@ -1341,7 +1341,7 @@ class Model(object):
                             # now get distance measure to this interface
                             iface_dist = ndi.distance_transform_edt(~iface_mask)
                             # and make a threshold 'sausage' volume.
-                            iface_ball = (iface_dist <= self.result.hqv_width)
+                            iface_ball = (iface_dist <= 2.*self.result.hqv_width)
                             del(iface_dist)
                             vol_frac = [np.float32(np.mean((self.result.vol_seg==label)[np.nonzero(iface_ball)])) for label in group_labels]
                         else:
@@ -1749,7 +1749,7 @@ class Model(object):
         null_locs = self.source.null_locs
         N_null=null_locs.shape[1]
         
-        int_distance = np.zeros((N_null, np.size(labels))).astype('float32')
+        reg_distance = np.zeros((N_null, np.size(labels))).astype('float32')
         hqv_distance = np.zeros((N_null, np.size(labels))).astype('float32')
 
         for n in range(N_null):
@@ -1772,13 +1772,13 @@ class Model(object):
                     hqv_distance[n,i] = hqv_box_dist
                 else:
                     hqv_distance[n,i] = max(0.5, dist_mm[np.nonzero(hqv_msk)].min())
-                int_msk = (self.result.vol_seg == labels[i])
+                reg_msk = (self.result.vol_seg == labels[i])
                 # test the typical int msk at the null box
-                int_box_dist = np.mean(~int_msk[box_indices])
-                if (int_box_dist < 0.5):
-                    int_distance[n,i] = int_box_dist
+                reg_box_dist = np.mean(~reg_msk[box_indices])
+                if (reg_box_dist < 0.5):
+                    reg_distance[n,i] = reg_box_dist
                 else:
-                    int_distance[n,i] = max(0.5, dist_mm[np.nonzero(int_msk)].min())
+                    reg_distance[n,i] = max(0.5, dist_mm[np.nonzero(reg_msk)].min())
                 # with these conventions, the distance can go to zero, even if the null is not centered on a given pixel.
                 #print('region: '+str(labels[i])+', null: '+str(n)+', hqv distance: '+str(hqv_distance[i,j])+', int distance:'+str(int_distance[i,j]))
         print('finding distances to null:',n,'            ')
@@ -1786,8 +1786,8 @@ class Model(object):
         dist_object = Foo()
         setattr(dist_object, 'labels', np.int32(labels))
         setattr(dist_object, 'nulls', np.int32(np.arange(N_null)))
-        setattr(dist_object, 'int_distance', np.float32(int_distance))
-        setattr(dist_object, 'hqv_distance', np.float32(hqv_distance))
+        setattr(dist_object, 'reg_int_distance', np.float32(reg_distance))
+        setattr(dist_object, 'reg_hqv_distance', np.float32(hqv_distance))
 
         try:
             setattr(self.result, 'null_to_region_dist', dist_object)
@@ -1821,9 +1821,11 @@ class Model(object):
         N_null=null_locs.shape[1]
         
         hqv_distance = []
+        reg_distance = []
 
         for n in range(N_null):
             hqv_distance.append([])
+            reg_distance.append([])
             box = np.array(self.make_null_box(null_num=n, box_size=2)).T
             box_indices = (box[0], box[1], box[2])
             # we'll do measurements in sphericals but assuming orthonormality -- this is innacurate for large distances but we only care about small distances.
@@ -1847,13 +1849,21 @@ class Model(object):
                     hqv_distance[n].append(hqv_box_dist)
                 else:
                     hqv_distance[n].append(max(0.5, dist_mm[np.nonzero(obj.hqv_msk)].min()))
+                # test the typical int msk at the null box
+                reg_msk = (self.result.vol_seg == obj.label)
+                reg_box_dist = np.mean(~reg_msk[box_indices])
+                if (reg_box_dist < 0.5):
+                    reg_distance[n].append(reg_box_dist)
+                else:
+                    reg_distance[n].append(max(0.5, dist_mm[np.nonzero(reg_msk)].min()))
                 # print('distance to null:', hqv_distance[j][-1])
         print('finding distances to null:',n,'            ')
         dist_object = Foo()
         setattr(dist_object, 'labels', np.int32(label_axis))
         setattr(dist_object, 'sublabels', np.int32(sublabel_axis))
         setattr(dist_object, 'nulls', np.int32(np.arange(N_null)))
-        setattr(dist_object, 'hqv_distance', np.array(hqv_distance, dtype='float32'))
+        setattr(dist_object, 'reg_hqv_distance', np.array(hqv_distance, dtype='float32'))
+        setattr(dist_object, 'reg_int_distance', np.array(reg_distance, dtype='float32'))
 
         try:
             setattr(self.result, 'null_to_intHQV_dist', dist_object)
@@ -1907,47 +1917,54 @@ class Model(object):
 
         import numpy as np
 
-        # now we'll loop through intersection groups
+        # now we'll loop through exterior HQVs
         print('associating nulls to exterior HQVs')
         for hqv_obj in self.result.exterior_HQVs:
             associated_nulls = []
             for ni in self.result.null_to_region_dist.nulls:
-                hqv_dist_list = []
-                reg_dist_list = []
+                temp_obj = Foo()
+                reg_hqv_dist_vec = []
+                reg_int_dist_vec = []
                 for label in hqv_obj.labels:
                     ri, = np.nonzero(label == self.result.null_to_region_dist.labels)
-                    hqv_dist_list.append(self.result.null_to_region_dist.hqv_distance[ni,ri])
-                    reg_dist_list.append(self.result.null_to_region_dist.int_distance[ni,ri])
-                hqv_dist = np.sqrt(np.mean(np.array(hqv_dist_list)**2))
-                reg_dist = np.sqrt(np.mean(np.array(reg_dist_list)**2))
-                if np.min([hqv_dist, reg_dist]) <= self.result.hqv_width:
-                    # print('associating null',ni,'exterior HQV',hqv_obj.labels,'at distance',hqv_dist,'                        ',end='\r')
-                    temp_obj = Foo()
-                    setattr(temp_obj, 'null', ni)
-                    setattr(temp_obj, 'labels', hqv_obj.labels)
-                    setattr(temp_obj, 'hqv_dist', hqv_dist)
-                    setattr(temp_obj, 'reg_dist', reg_dist)
-                    associated_nulls.append(temp_obj)
-            # print('associating null',ni,'exterior HQV',hqv_obj.labels,'at distance',hqv_dist,'                        ')
+                    reg_hqv_dist_vec.append(self.result.null_to_region_dist.reg_hqv_distance[ni,ri][0])
+                    reg_int_dist_vec.append(self.result.null_to_region_dist.reg_int_distance[ni,ri][0])
+                reg_hqv_dist_rms = np.sqrt(np.mean(np.array(reg_hqv_dist_vec)**2))
+                reg_int_dist_rms = np.sqrt(np.mean(np.array(reg_int_dist_vec)**2))
+                setattr(temp_obj, 'null', ni)
+                setattr(temp_obj, 'labels', hqv_obj.labels)
+                setattr(temp_obj, 'reg_hqv_dist_vec', reg_hqv_dist_vec)
+                setattr(temp_obj, 'reg_hqv_dist_rms', reg_hqv_dist_rms)
+                setattr(temp_obj, 'reg_int_dist_vec', reg_int_dist_vec)
+                setattr(temp_obj, 'reg_int_dist_rms', reg_int_dist_rms)
+                associated_nulls.append(temp_obj)
+            # now we reorder by hqv_dist_rms
+            dlist = [el.reg_hqv_dist_rms for el in associated_nulls] 
+            idxs = np.argsort(dlist)
+            associated_nulls = [associated_nulls[idx] for idx in idxs]
             setattr(hqv_obj, 'associated_nulls', associated_nulls)
 
-        # now we'll loop through detached HQVs
+        # now we'll loop through interior HQVs
         print('associating nulls to interior HQVs')
         for hqv_obj in self.result.interior_HQVs:
             associated_nulls=[]
             # need to loop over the subregions for this specific region
             ri, = np.nonzero((hqv_obj.sublabel == self.result.null_to_intHQV_dist.sublabels) & (hqv_obj.label == self.result.null_to_intHQV_dist.labels))
             for ni in self.result.null_to_intHQV_dist.nulls:
-                hqv_dist = np.mean(self.result.null_to_intHQV_dist.hqv_distance[ni,ri])
-                if hqv_dist <= self.result.hqv_width:
-                    # print('associating null',ni,'with interior HQV',hqv_obj.label,':',hqv_obj.sublabel,'at distance',hqv_dist,'                        ',end='\r')
-                    temp_obj = Foo()
-                    setattr(temp_obj, 'null', ni)
-                    setattr(temp_obj, 'label', hqv_obj.label)
-                    setattr(temp_obj, 'sublabel', hqv_obj.sublabel)
-                    setattr(temp_obj, 'hqv_dist', hqv_dist)
-                    associated_nulls.append(temp_obj)
-            # print('associating null',ni,'with interior HQV',hqv_obj.label,':',hqv_obj.sublabel,'at distance',hqv_dist,'                        ')
+                temp_obj = Foo()
+                reg_hqv_dist = self.result.null_to_intHQV_dist.reg_hqv_distance[ni,ri][0]
+                reg_int_dist = self.result.null_to_intHQV_dist.reg_int_distance[ni,ri][0]
+                setattr(temp_obj, 'null', ni)
+                setattr(temp_obj, 'label', hqv_obj.label)
+                setattr(temp_obj, 'sublabel', hqv_obj.sublabel)
+                setattr(temp_obj, 'reg_hqv_dist', reg_hqv_dist)
+                setattr(temp_obj, 'reg_int_dist', reg_int_dist)
+                associated_nulls.append(temp_obj)
+                
+            # now we reorder by hqv_dist
+            dlist = [el.reg_hqv_dist for el in associated_nulls] 
+            idxs = np.argsort(dlist)
+            associated_nulls = [associated_nulls[idx] for idx in idxs]
             setattr(hqv_obj, 'associated_nulls', associated_nulls)
 
         # finally, we'll tabulate a list of information organized by null number
@@ -1957,23 +1974,39 @@ class Model(object):
         print('tabulating associations by null index')
         
         for n in range(self.source.null_locs.shape[1]):
+            null_info_obj = Foo()
             null_box = self.make_null_box(null_num=n, box_size=2)
-            labels = list(np.unique([self.result.vol_seg[loc] for loc in null_box]))
+            corner_labels = list(np.unique([self.result.vol_seg[loc] for loc in null_box]))
             associated_extHQVs = []
             associated_intHQVs = []
+            extHQV_dist = []
+            intHQV_dist = []
+            #loop over ext HQVs and get null distances
             for hqv_obj in self.result.exterior_HQVs:
                 for null_obj in hqv_obj.associated_nulls:
-                    if (null_obj.null == n): associated_extHQVs.append(hqv_obj)
+                    if (null_obj.null == n):
+                        associated_extHQVs.append(hqv_obj)
+                        extHQV_dist.append(null_obj.reg_hqv_dist_rms)
+            #loop over int HQVs and get null distances
             for hqv_obj in self.result.interior_HQVs:
                 for null_obj in hqv_obj.associated_nulls:
-                    if (null_obj.null == n): associated_intHQVs.append(hqv_obj)
-            
-            null_info_obj = Foo()
+                    if (null_obj.null == n):
+                        associated_intHQVs.append(hqv_obj)
+                        intHQV_dist.append(null_obj.reg_hqv_dist)
+            #sort by distance
+            extHQV_idxs = np.argsort(extHQV_dist)
+            intHQV_idxs = np.argsort(intHQV_dist)
+            extHQV_dist = [extHQV_dist[idx] for idx in extHQV_idxs]
+            intHQV_dist = [intHQV_dist[idx] for idx in intHQV_idxs]
+            associated_extHQVs = [associated_extHQVs[idx] for idx in extHQV_idxs]
+            associated_intHQVs = [associated_intHQVs[idx] for idx in intHQV_idxs]
             setattr(null_info_obj, 'null', n)
             setattr(null_info_obj, 'null_loc', self.source.null_locs[:,n])
-            setattr(null_info_obj, 'labels', labels)
+            setattr(null_info_obj, 'corner_labels', corner_labels)
             setattr(null_info_obj, 'extHQVs', associated_extHQVs)
             setattr(null_info_obj, 'intHQVs', associated_intHQVs)
+            setattr(null_info_obj, 'extHQV_dist', extHQV_dist)
+            setattr(null_info_obj, 'intHQV_dist', intHQV_dist)
             null_info.append(null_info_obj)
 
         setattr(self.result, 'null_info', null_info)
@@ -2639,8 +2672,9 @@ class Model(object):
 
 ###################################################
 
-def portattr(target_object, name, attribute):
+def portattr(target_object, name, attribute, force=None):
     # this routine works like setattr but it detects model objects and instantiates from new
+    if force is None: force=False
     namelist = ['Inputs', 'Source', 'Result', 'Foo']
     classname = attribute.__class__.__name__
     if classname in namelist: # attribute is a class object unto itself
@@ -2651,9 +2685,14 @@ def portattr(target_object, name, attribute):
             for key in attribute.__dict__.keys():
                 if key[0] != '_':
                     if key not in getattr(target_object, name).__dict__.keys() and classname is not 'Foo':
-                        print('Setting unmatched attribute "',key,'" in object "',name,'"-- check version control.')
-                    #print('Setting subattribute', key)
-                    portattr(getattr(target_object, name), key, getattr(attribute, key))
+                        if force:
+                            print('Setting unmatched attribute "',key,'" in object "',name,'"-- check version control.')
+                            portattr(getattr(target_object, name), key, getattr(attribute, key))
+                        else:
+                            print('Refusing unmatched attribute "',key,'" in object "',name,'"-- check version control.')
+                    else:
+                        portattr(getattr(target_object, name), key, getattr(attribute, key))
+                            
         except:
             print('Cannot instantiate',name)
     else: # attribute is simply object
