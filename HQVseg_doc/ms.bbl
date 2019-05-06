@@ -1,0 +1,24 @@
+ \newcommand{\noop}[1]{}
+\begin{thebibliography}{}
+\expandafter\ifx\csname natexlab\endcsname\relax\def\natexlab#1{#1}\fi
+
+\bibitem[{Jones {et~al.}(2001)Jones, Oliphant, Peterson, {et~al.}}]{SciPy}
+Jones, E., Oliphant, T., Peterson, P., {et~al.} 2001, {SciPy}: Open source
+  scientific tools for {Python}, http://www.scipy.org/, [Online; accessed
+  2018-01-15]
+
+\bibitem[{{Scott} {et~al.}(2018){Scott}, {Pontin}, {Yeates}, {Wyper}, \&
+  {Higginson}}]{Scott:2018a}
+{Scott}, R.~B., {Pontin}, D.~I., {Yeates}, A.~R., {Wyper}, P.~F., \&
+  {Higginson}, A.~K. 2018, \apj, 869, 60
+
+\bibitem[{Tassev \& Savcheva(2017)}]{Tassev:2016}
+Tassev, S., \& Savcheva, A. 2017, \apj, 840, 0
+
+\bibitem[{van~der Walt {et~al.}(2014)van~der Walt, S~ch onberger,
+  Nunez-Iglesias, B~oulogne, W~arner, Y~ager, G~ouillart, Y~u, \&
+  contributors}]{scikit-image}
+van~der Walt, S. t.~e., S~ch onberger, J. o.~L., Nunez-Iglesias, J.~u.,
+  {et~al.} 2014, PeerJ, 2, e453
+
+\end{thebibliography}
