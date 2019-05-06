@@ -61,7 +61,7 @@ class Inputs(object):
 
     def __init__(self, nrr=None, nth=None, nph=None, phmin=None, phmax=None, thmin=None, thmax=None, rrmin=None, \
                  rrmax=None, r_samp=None, solrad=None, q_dir=None, b_dir=None, glbl_mdl=None, ss_eof=None, \
-                 sbn_thrsh=None, ltq_thrsh=None, adj_thrsh=None, phi_bnd_thrsh=None, pad_ratio=None, bot_rad=None, \
+                 sbn_thrsh=None, ltq_thrsh=None, adj_thrsh=None, pad_ratio=None, bot_rad=None, \
                  auto_imp=None, auto_seg=None, protocol=None, vis_title=None):
 
         self.nrr=nrr
@@ -82,7 +82,6 @@ class Inputs(object):
         self.sbn_thrsh=sbn_thrsh
         self.ltq_thrsh=ltq_thrsh
         self.adj_thrsh=adj_thrsh
-        self.phi_bnd_thrsh=phi_bnd_thrsh
         self.pad_ratio=pad_ratio
         self.bot_rad=bot_rad
         self.auto_imp=auto_imp
@@ -145,7 +144,7 @@ class Result(object):
     # a class object for tholding the results of the segmentation etc. #
     ####################################################################
 
-    def __init__(self, hqv_msk=None, GlnQp=None, reg_width=None, hqv_width=None, pad_msk=None, \
+    def __init__(self, hqv_msk=None, PIL_msk=None, GlnQp=None, reg_width=None, hqv_width=None, pad_msk=None, \
                  vol_seg=None, seg_msk=None, adj_msk=None, exterior_HQVs=None, interior_HQVs=None, \
                  null_to_region_dist=None, null_to_intHQV_dist=None, null_info=None, \
                  open_labels=None, clsd_labels=None, opos_labels=None, oneg_labels=None, labels=None):
@@ -155,6 +154,7 @@ class Result(object):
         # these come from the mask building
 
         self.hqv_msk            =hqv_msk
+        self.PIL_msk            =PIL_msk
         self.GlnQp              =GlnQp
 
         # these attributes come from the original segmentation
@@ -274,23 +274,24 @@ class Model(object):
         self.import_bfield_data()
 
     def do_segment(self):
-        self.build_hqv_msk()
-        self.segment_volume()
+        self.build_masks()
+        self.segment_volume(visualize=True)
 
-    def do_group(self):
+    def do_itemize(self):
         self.determine_adjacency()
-        self.find_exterior_HQVs()
         self.find_interior_HQVs()
+        self.find_exterior_HQVs()
 
     def do_inspect(self):
         self.get_null_region_dist()
         self.get_null_intHQV_dist()
-        self.associate_nulls()
+        self.associate_structures()
+        self.categorize_structures()
 
     def do_all(self, auto_save=None):
         self.do_import()
         self.do_segment()
-        self.do_group()
+        self.do_itemize()
         self.do_inspect()
         if auto_save: self.save_data()
 
@@ -301,11 +302,11 @@ class Model(object):
     # definitions of model methods ##################
     #################################################
     
-    def cloan(self, donor):
+    def cloan(self, donor, force=None):
         # a wrapper for porting all attributes
         for key in donor.__dict__.keys():
             if key in ['inputs', 'source', 'result']:
-                portattr(self, key, getattr(donor, key))
+                portattr(self, key, getattr(donor, key), force=force)
         return self
 
     #################################################
@@ -403,6 +404,9 @@ class Model(object):
         if self.inputs.protocol=='standard_QSLsquasher':
             if self.inputs.q_dir is None:
                 self.inputs.q_dir = os.getcwd()
+            else:
+                try: self.inputs.q_dir = os.path.abspath(self.inputs.q_dir)
+                except TypeError: pass
             print('Loading Q data')
             self.source.slog10q=(np.array(pd.read_table(self.inputs.q_dir+'/grid3d.dat',header=None).astype('float32')))[...,0].reshape((self.inputs.nph,self.inputs.nth,self.inputs.nrr))
             print('Success        \n%%%%%%%%%%%%%%%%%%%%%%%%%%%%')
@@ -503,7 +507,7 @@ class Model(object):
             self.source.bph = bph_interpolator(q_pts).T.reshape(self.source.cph.shape).astype('float32')
             self.source.bth = bth_interpolator(q_pts).T.reshape(self.source.cph.shape).astype('float32')
             self.source.brr = brr_interpolator(q_pts).T.reshape(self.source.cph.shape).astype('float32')
-
+            
             print('Importing Null Locations \n%%%%%%%%%%%%%%%%%%%%%%%%%%%%')
             null_loc_fname = self.inputs.b_dir+'/nullpositions.dat'
             if os.path.isfile(null_loc_fname):
@@ -534,7 +538,7 @@ class Model(object):
 
 
     
-    def build_hqv_msk(self, sbn_thrsh=None, ltq_thrsh=None, exclude_clip=None):
+    def build_masks(self, sbn_thrsh=None, ltq_thrsh=None, exclude_clip=None):
 
         ######################################################################
         # this method generates the mask that is used for the domain mapping #
@@ -542,11 +546,16 @@ class Model(object):
         
         import numpy as np
         from skimage import morphology as mor
+
+        # first get the PIL just for later use
+        print('Building PIL mask')
+        dbr_dph, dbr_dth, dbr_drr = np.gradient(self.source.brr, np.pi*self.source.cph[:,0,0]/180, np.pi*self.source.cth[0,:,0]/180, self.source.crr[0,0,:], axis=(0,1,2))
+        self.result.PIL_msk = (self.source.crr**2 * (dbr_dph**2 + dbr_dth**2 + dbr_drr**2) > 10**10 * self.source.brr**2)
         
         ### get the derivs.
         ### normalize derivs. want r*grad so deriv scales to radius
         ### in spherical, grad is d/dr, 1/r d/dth, 1/rsinth d/dph
-        print('Calculating derivatives')
+        print('Calculating Qperp derivatives')
         ### we'll clip the datavalue before differentiating so that 10**value is within the range of float32
         ltqmax = np.log10(np.finfo('float32').max)-1
         clip_slog10q = np.clip(np.absolute(self.source.slog10q), -ltqmax, ltqmax)
@@ -573,7 +582,7 @@ class Model(object):
         # threshold on just Q
         if not ltq_thrsh:
             if not self.inputs.ltq_thrsh:
-                self.inputs.ltq_thrsh = 4 # can't get an RMS of Q b.c. the norm is infinite by definition... just choose something large.
+                self.inputs.ltq_thrsh = 3.7 # can't get an RMS of Q b.c. the norm is infinite by definition... just choose something large (10**3.7 ~ 5000).
                 print('LTQ threshold not specified: defaulting to',self.inputs.ltq_thrsh)
             else:
                 print('LTQ threshold specified by inputs obj as: ', self.inputs.ltq_thrsh)
@@ -625,7 +634,7 @@ class Model(object):
         #########################################################
         import pdb
         
-        if self.result.hqv_msk is None: self.build_hqv_msk()
+        if self.result.hqv_msk is None: self.build_masks()
             
         import time
         import numpy as np
@@ -660,7 +669,6 @@ class Model(object):
             crr     = self.global_expand(crr)
             brr     = self.global_expand(brr)
             GlnQp   = self.global_expand(GlnQp)
-            #(self.result.hqv_msk, self.source.slog10q, self.source.crr, self.source.brr, self.result.GlnQp) = (None, None, None, None, None)
 
 
         vol_seg = np.zeros(hqv_msk.shape, dtype='int32')### initiate segmentation label array.
@@ -831,7 +839,7 @@ class Model(object):
         if visualize:
             plt.figure(10)
             plt.imshow(vol_seg[...,-1].T, origin='lower')
-            plt.savefig(self.inputs.q_dir+'vol_seg8.pdf')
+            plt.savefig(self.inputs.q_dir+'/vol_seg8.pdf')
         
         print('Relabeling to remove obsolete domains') 
         # now let's relabel with integer labels removing gaps
@@ -1412,7 +1420,7 @@ class Model(object):
                                 # now get distance measure to this interface
                                 iface_dist = ndi.distance_transform_edt(~iface_mask)
                                 # threshold distance makes 'sausage' volume
-                                iface_ball = (iface_dist <= self.result.hqv_width)
+                                iface_ball = (iface_dist <= 2.*self.result.hqv_width)
                                 del(iface_dist)
                                 vol_frac = [np.float32(np.mean((self.result.vol_seg==label)[np.nonzero(iface_ball)])) for label in group_labels]
                             else:
@@ -1449,9 +1457,6 @@ class Model(object):
         
         print('Success \n%%%%%%%%%%%%%%%%%%%%%%%%%%%%')
 
-        # might as well tag them now
-        self.tag_exterior_HQVs()
-
         if return_list: return group_list
         
         ########################
@@ -1459,93 +1464,7 @@ class Model(object):
         ########################
 
 
-    def tag_exterior_HQVs(self, return_list=None):
 
-        import numpy as np
-
-        group_list = self.result.exterior_HQVs
-        
-        print('Inspecting exterior HQVs')
- 
-        #things that we want to know:
-        #1 for n=2, is it a layer, or is it just a part of a vertex?
-        #2 for n=2, if it is a layer: is it a branch, is it a simple layer, or is it w/in the HCS
-        #3 for n>2, is it in the HCS or not? this does not depend on inherited information
-        #3 for n>2, if not in HCS, is it a vertex? or is it just a merger? this also does not depend on inherited information.
-
-        #strategy: vertices don't care whether their parents are branches/layers/etc. So we should work fron large n to small n
-
-        # first the things that depend on parents, increasing order
-        for group in group_list:
-            group.conn_HCS=None # connects to HCS
-            group.part_HCS=(group.top & group.opos & group.oneg) # part of HCS
-            group.conn_OCB=None # connects to OCB
-            group.part_OCB=(group.clsd & (group.opos | group.oneg)) # part of OCB
-            group.conn_vtx=None # connects to vertex
-            group.part_vtx=None # part of vertex -- in case of n=2, this implies vtx-only layer
-            group.part_mgr=None
-            group.conn_mgr=None
-            group.merger  =None # like a vertex but too accute
-            group.accute  =None # deals with opening angle in triplets
-            group.simple  =None # boolean if simple layer
-            group.branch  =None # boolean if branch layer
-            group.cochild =None # index for cochild
-            group.open_child=None # if has child with imprint at top boundary
-            if (group.n_regs == 3):
-                group.accute = bool( ( np.min(group.vol_frac) < 0.1) | ( np.min(group.vol_frac) < np.max(group.vol_frac)/6 ) )
-                group.part_vtx = group.reg_iface and group.top and (not group.part_HCS) and (not group.accute)
-                group.part_mgr = group.reg_iface and group.top and (not group.part_HCS) and group.accute
-                #print(group.labels,'vertex accusement pass:', group.part_vtx)
-            if (group.n_regs >= 4):
-                parent_vtx_rat = np.mean([bool(group_list[parent].part_vtx) for parent in group.parents])
-                group.part_vtx = (parent_vtx_rat >= 0.5) and group.top and (not group.part_HCS)
-                #print(group.labels,'parent vertex accuteness pass:', group.part_vtx)
-
-        # next, the things the depend on children, in decreasing order:
-        for group in group_list[::-1]: # loop through backwards
-            
-            coparent_labels = [] # this will be populated later
-            for child in group.children:
-                # basic inherited traits
-                if (not group_list[child].clsd):
-                    group.open_child=True
-                if group_list[child].part_mgr:
-                    group.conn_mgr=True
-                if group_list[child].part_HCS:
-                    group.conn_HCS=True
-                if group_list[child].part_OCB:
-                    group.conn_OCB=True
-                if group_list[child].part_vtx:
-                    group.conn_vtx=True
-                # advanced coparent information
-                if (group.n_regs==2):
-                    for coparent in group_list[child].parents:
-                        if not group_list[coparent].clsd:
-                            coparent_labels.append(group_list[coparent].labels)
-            # now we determine which structures are part of vertices
-            # is there a child element whose parent labels exactly matches the list of all parents for all children of the current group
-            # if so, then the current group exists only within a it's collective child groups
-            # otherwise there would be multiple child branches, that would not overlap
-            if (group.n_regs==2):
-                try:
-                    cochild = [el for el in group_list if ((el.labels == list(np.unique(coparent_labels))) and (el.n_regs > group.n_regs) and not el.clsd)][0]
-                    group.cochild = np.nonzero([(cochild == el) for el in group_list])[0][0]
-                    if group.top and cochild.top and (not group.part_HCS) and (not cochild.part_HCS):
-                        group.part_vtx = cochild.part_vtx
-                except IndexError:
-                    pass
-                group.branch = group.top and group.reg_iface and group.conn_vtx and (not group.part_vtx) and (not group.part_HCS)
-                group.simple = group.top and group.reg_iface and (not group.conn_vtx) and (not group.part_vtx) and group.conn_HCS and (not group.part_HCS)
-                                
-        setattr(self.result, 'exterior_HQVs', group_list)
-        
-        print('Success \n%%%%%%%%%%%%%%%%%%%%%%%%%%%%')
-
-        if return_list: return group_list
-        
-        ########################
-        # end of method ########
-        ########################
     
 
         
@@ -1570,12 +1489,14 @@ class Model(object):
 
             # get the hqv volume that is not part of an interface
             reduced = list(self.result.labels[np.nonzero(self.result.labels != reg)])# all regions apart from the one specified...
+            reg_msk = (self.result.vol_seg==reg)
             reg_hqv = self.get_reg_hqv(labels=[reg])
             ext_hqv = self.get_reg_hqv(labels=reduced, logic='Union')
             vol_seg = self.result.vol_seg
 
             # expand to allow growing through boundary
             if self.inputs.glbl_mdl:
+                reg_msk = self.global_expand(reg_msk)
                 reg_hqv = self.global_expand(reg_hqv)
                 ext_hqv = self.global_expand(ext_hqv)
                 vol_seg = self.global_expand(vol_seg)
@@ -1585,14 +1506,14 @@ class Model(object):
             reg_dtc = reg_hqv & ~reg_ifc
             #del(reg_hqv, ext_hqv)
             hqv_area = np.pi*(self.result.hqv_width)**2
-            hqv_vol = (4*np.pi/3)*(self.result.hqv_width)**3
+            hqv_vol = (4*np.pi/3)*(0.5*self.result.hqv_width)**3
 
             # test volume for detached subvolumes
             if np.sum(reg_dtc) > hqv_vol:
                 print('found detached hqv in excess of typical hqv volume for region',reg)
                 dist_to_ifc = ndi.distance_transform_edt(~reg_ifc & (vol_seg==reg) )
                 #print('computed distances to interface')
-                msk = (reg_dtc & (dist_to_ifc > self.result.hqv_width))
+                msk = (reg_dtc & (dist_to_ifc > 0.5*self.result.hqv_width))
                 msk = mor.closing(mor.opening(msk)) & ~reg_ifc
                 if np.sum(msk)==0:
                     print('no significant detached features detected')
@@ -1602,19 +1523,19 @@ class Model(object):
                     # if global enforce periodicity and reduce to original grid
                     badregs = np.zeros(subvols.shape, dtype='bool')
                     sublabels = (np.unique(subvols[np.where(subvols!=0)]))
-
                     # remove small objects
-                    
                     #print(sublabels.size,'unique contiguous features found -- filtering')
                     for sublabel in sublabels:
                         msk = (subvols == sublabel)
                         msk_ind = np.where(subvols==sublabel)
-                        if ((np.sum(msk) > hqv_vol) and (dist_to_ifc[msk_ind].mean() > self.result.hqv_width) and msk[...,-1].max()):
+                        if ((np.sum(msk) >= hqv_vol) and (dist_to_ifc[msk_ind].mean() >= 0.5*self.result.hqv_width) and msk[...,-1].max()):
                             print('found significant detached segment in subregion',sublabel)
                         else:
-                            subvols[msk_ind]=0
                             badregs[msk_ind]=True                       
-
+                    #zero out regs that didn't pass the test
+                    try: subvols[np.nonzero(badregs)] = 0
+                    except IndexError: pass
+                    
                     old_sublabels = (np.unique(subvols[np.where(subvols!=0)]))
                     # test to see if there's anything to work with.
                     #print(old_sublabels.size, 'unique contiguous feature(s) remain')
@@ -1622,22 +1543,20 @@ class Model(object):
                         print('no significant features remain after filter')
                     else:
                         # surviving regions are grown back into mask
-                        #print('calculating distance to new features')
-                        dist_to_reg = ndi.distance_transform_edt(subvols==0)
-                        #print('growing features within threshold distance')
-                        reg_dtc_overlap = get_mask_boundary(reg_dtc) & reg_ifc
-                        subvols=mor.watershed(dist_to_reg, subvols, mask=((reg_dtc | reg_dtc_overlap) & ~badregs & (dist_to_reg < 2.0*self.result.hqv_width)))
-                        del(dist_to_reg)
+                        dist_to_sublabels = ndi.distance_transform_edt(subvols==0)
+                        # only grow to pixels bounded by 1.5 x hqv_width from discrete labels (0.5 for origin thrshold and 1.0 for overlap)
+                        subvols=mor.watershed(dist_to_sublabels, subvols, mask=(reg_msk & reg_hqv & (dist_to_sublabels <= 1.5*self.result.hqv_width)))
+                        del(dist_to_sublabels)
                         # inclusion of the distance threshold limits growth along surface of ifc to keep structure compact.
                         # now we reduce if global
                         if self.inputs.glbl_mdl:
                             subvols = self.global_reduce(subvols)
                             vol_seg = self.global_reduce(vol_seg)
+                            reg_msk = self.global_reduce(reg_msk)
                             reg_hqv = self.global_reduce(reg_hqv)
                             ext_hqv = self.global_reduce(ext_hqv)
                             reg_ifc = self.global_reduce(reg_ifc)
                             reg_dtc = self.global_reduce(reg_dtc)
-                            reg_dtc_overlap = self.global_reduce(reg_dtc_overlap)
                             #print('associating labels for periodicity')
                             self.associate_labels(subvols, axis=0, use_boundary=True)
                         # renumber to remove missing entries
@@ -1653,8 +1572,8 @@ class Model(object):
                         print(np.size(sublabels),'unique features remain after filtering')
                         for i in range(sublabels.size):
                             submask = (subvols==sublabels[i])
-                            fully_detached = ( ( submask & reg_dtc_overlap ).max() == 0 ) 
-                            polar_artefact = ( ( submask[:,0,:].max() == 1 ) | ( submask[:,-1,:].max() == 1 ) )
+                            fully_detached = not bool( ( submask & reg_ifc ).max() ) 
+                            polar_artefact = ( bool( submask[:,0,:].max() ) | bool( submask[:,-1,:].max() ) )
                             hqv_obj = Foo()
                             setattr(hqv_obj, 'label', reg)
                             setattr(hqv_obj, 'sublabel', sublabels[i])
@@ -1913,11 +1832,13 @@ class Model(object):
 
         
 
-    def associate_nulls(self):
+    def associate_structures(self):
 
+        # this routine is designed to connect the various disperate structures
+        
         import numpy as np
 
-        # now we'll loop through exterior HQVs
+        # first now we'll loop through exterior HQVs and check for nulls
         print('associating nulls to exterior HQVs')
         for hqv_obj in self.result.exterior_HQVs:
             associated_nulls = []
@@ -1944,7 +1865,7 @@ class Model(object):
             associated_nulls = [associated_nulls[idx] for idx in idxs]
             setattr(hqv_obj, 'associated_nulls', associated_nulls)
 
-        # now we'll loop through interior HQVs
+        # now we'll loop through interior HQVs and check for nulls
         print('associating nulls to interior HQVs')
         for hqv_obj in self.result.interior_HQVs:
             associated_nulls=[]
@@ -1959,8 +1880,7 @@ class Model(object):
                 setattr(temp_obj, 'sublabel', hqv_obj.sublabel)
                 setattr(temp_obj, 'reg_hqv_dist', reg_hqv_dist)
                 setattr(temp_obj, 'reg_int_dist', reg_int_dist)
-                associated_nulls.append(temp_obj)
-                
+                associated_nulls.append(temp_obj)            
             # now we reorder by hqv_dist
             dlist = [el.reg_hqv_dist for el in associated_nulls] 
             idxs = np.argsort(dlist)
@@ -2011,6 +1931,32 @@ class Model(object):
 
         setattr(self.result, 'null_info', null_info)
 
+        print('testing overlap of interior and exterior HQVs')
+        
+        # finally, we inspect the relationship between exterior and interior HQVs
+        for int_hqv_obj in self.result.interior_HQVs: setattr(int_hqv_obj, 'associated_extHQVs', [])
+        for ext_hqv_obj in self.result.exterior_HQVs: setattr(ext_hqv_obj, 'associated_intHQVs', [])
+
+        n_int = np.size(self.result.interior_HQVs)
+        n_ext = np.size(self.result.exterior_HQVs)
+        for int_idx in range(n_int):
+            int_hqv_obj = self.result.interior_HQVs[int_idx]
+            for ext_idx in range(n_ext):
+                ext_hqv_obj = self.result.exterior_HQVs[ext_idx]
+                if (int_hqv_obj.label in ext_hqv_obj.labels) and not ext_hqv_obj.clsd:
+                    # check if all parents are  already associated with this int_hqv
+                    all_parents_in = True
+                    for parent_idx in ext_hqv_obj.parents:
+                        all_parents_in = all_parents_in * (self.result.exterior_HQVs[parent_idx] in int_hqv_obj.associated_extHQVs)
+                    # we test if the parents are in (or if there are no parents)
+                    if ((ext_hqv_obj.n_regs == 2) or all_parents_in):
+                        if (np.sum( int_hqv_obj.hqv_msk & self.get_reg_hqv(labels = ext_hqv_obj.labels) ) > 0):
+                            print('... overlap found for ',int_hqv_obj.label,':',int_hqv_obj.sublabel,' against ',ext_hqv_obj.labels,'...')
+                            int_hqv_obj.associated_extHQVs.append(self.result.exterior_HQVs[ext_idx])
+                            ext_hqv_obj.associated_intHQVs.append(self.result.interior_HQVs[int_idx])
+                    else:
+                        pass
+
 
         print('success...')
         
@@ -2022,7 +1968,121 @@ class Model(object):
 
 
 
+    def categorize_structures(self, return_list=None):
 
+        import numpy as np
+
+        group_list = self.result.exterior_HQVs
+        
+        print('Inspecting exterior HQVs')
+ 
+        #things that we want to know:
+        #1 for n=2, is it a layer, or is it just a part of a vertex?
+        #2 for n=2, if it is a layer: is it a branch, is it a simple layer, or is it w/in the HCS
+        #3 for n>2, is it in the HCS or not? this does not depend on inherited information
+        #3 for n>2, if not in HCS, is it a vertex? or is it just a merger? this also does not depend on inherited information.
+
+        #strategy: vertices don't care whether their parents are branches/layers/etc. So we should work fron large n to small n
+
+        # first the things that depend on parents, increasing order
+        for group in group_list:
+            group.conn_HCS=None # connects to HCS
+            group.part_HCS=(group.top & group.opos & group.oneg) # part of HCS
+            group.conn_OCB=None # connects to OCB
+            group.part_OCB=(group.clsd & (group.opos | group.oneg)) # part of OCB
+            group.conn_vtx=None # connects to vertex
+            group.part_vtx=None # part of vertex -- in case of n=2, this implies vtx-only layer
+            group.part_int=None # could be vertex, but less strict
+            group.conn_int=None # could be vertex, but less strict
+            group.merger  =None # like a vertex but too accute
+            group.accute  =None # deals with opening angle in triplets
+            group.simple  =None # boolean if simple layer
+            group.branch  =None # boolean if branch layer
+            group.cochild =None # index for cochild
+            group.open_child=None # if has child with imprint at top boundary
+            if (group.n_regs == 3):
+                group.accute = bool( ( np.min(group.vol_frac) < 0.1) | ( np.min(group.vol_frac) < np.max(group.vol_frac)/6 ) )
+                group.part_int = group.reg_iface and group.top and (not group.part_HCS)
+                #print(group.labels,'vertex accusement pass:', group.part_vtx)
+            if (group.n_regs >= 4):
+                group.accute = np.max([group_list[parent].accute for parent in group.parents])
+                parent_int_rat = np.mean([bool(group_list[parent].part_int) for parent in group.parents])
+                group.part_int = (parent_int_rat >= 0.5) and group.top and (not group.part_HCS)
+                #print(group.labels,'parent vertex accuteness pass:', group.part_vtx)
+            # find cochildren -- i.e., the object at the bottom of the parent tree for a given group.
+
+            # better name that cochild? what are we really talking about here!!!???
+            # also, need one version w/o HCS and another w/ HCS
+            # w/o deals with groupings w/in vertices
+            # w/ deals with groupings w/in HCS intersections
+            # want something like -- pair is part of an int which is w/in HCS, so pair is an artifact
+            # same way we have for vetex... pair is part of int that is not/in HCS, so pair is an artifact.
+            
+            coparent_labels = [] # this will be populated later
+            for child in group.children:
+                if not (group_list[child].opos & group_list[child].oneg):
+                    for coparent in group_list[child].parents:
+                        if not group_list[coparent].clsd:
+                            coparent_labels.append(group_list[coparent].labels)
+            try:
+                cochild = [el for el in group_list if ((el.labels == list(np.unique(coparent_labels))) and (el.n_regs > group.n_regs) and not el.clsd)][0]
+                group.cochild = np.int32(np.nonzero([(el == cochild) for el in group_list]))[0][0]
+            except IndexError:
+                pass
+                        
+
+        # next, the things the depend on children, in decreasing order:
+        for group in group_list[::-1]: # loop through backwards
+            # basic inherited traits
+            for child in group.children:
+                if (not group_list[child].clsd):
+                    group.open_child=True
+                if group_list[child].part_int:
+                    group.conn_int=True
+                if group_list[child].part_HCS:
+                    group.conn_HCS=True
+                if group_list[child].part_OCB:
+                    group.conn_OCB=True
+                if group_list[child].part_vtx:
+                    group.conn_vtx=True
+
+            if (group.part_int and not group.conn_HCS):
+                group.part_vtx = True 
+                        
+            # deeper inherited traits
+            if group.cochild is not None:
+                cochild = group_list[group.cochild]
+                if group.top and cochild.top:
+                    if not (group.part_HCS or group.conn_HCS or cochild.part_HCS or cochild.conn_HCS):
+                        group.part_vtx = cochild.part_vtx
+                    
+            group.branch = (group.n_regs == 2) and group.top and group.reg_iface and group.conn_vtx and not (group.part_vtx or group.part_HCS)
+            group.simple = (group.n_regs == 2) and group.top and group.reg_iface and group.conn_HCS and not (group.conn_vtx or group.part_vtx or group.part_HCS)
+            group.vertex = group.top and group.part_vtx and not group.cochild
+            group.hybrid = group.top and (group.simple or group.branch or group.vertex) and (np.size([el for el in group.associated_intHQVs if not el.polar_artefact]) > 0)
+        # then, we filter out structures that are vertices whose parents are also vertices
+        vtx_group = [el for el in group_list if el.vertex]
+        for el1 in vtx_group:
+            for parent in el1.parents:
+                if group_list[parent] in vtx_group:
+                    el1.vertex=False
+                                
+        setattr(self.result, 'exterior_HQVs', group_list)
+
+        print('Inspecting interior HQVs')
+
+        for obj in self.result.interior_HQVs:
+            obj.conn_vertex = bool(np.size([el for el in obj.associated_extHQVs if el.vertex]))
+            obj.conn_simple = bool(np.size([el for el in obj.associated_extHQVs if el.simple]))
+            obj.conn_branch = bool(np.size([el for el in obj.associated_extHQVs if el.branch]))
+            obj.conn_HCS    = bool(np.size([el for el in obj.associated_extHQVs if el.part_HCS]))
+            obj.conn_OCB    = bool(np.size([el for el in obj.associated_extHQVs if el.part_OCB]))
+            
+        print('Success \n%%%%%%%%%%%%%%%%%%%%%%%%%%%%')
+        
+        ########################
+        # end of method ########
+        ########################
 
 
 
@@ -2254,7 +2314,7 @@ class Model(object):
         return mskcmap
         
     
-    def visualize(self, window=None, figsize=None, cst_mask=None):
+    def visualize(self, window=None, figsize=None):
 
         import numpy as np
         import pylab as plt
@@ -2375,25 +2435,35 @@ class Model(object):
         axrr = plt.axes([0.125,   0.30, 0.12, 0.03], facecolor=axcolor)
         axth = plt.axes([0.125,   0.27, 0.12, 0.03], facecolor=axcolor)
         axph = plt.axes([0.125,   0.24, 0.12, 0.03], facecolor=axcolor)
-        axbp = plt.axes([0.125,   0.20, 0.04, 0.03], facecolor=axcolor)
-        axbr = plt.axes([0.165,   0.20, 0.04, 0.03], facecolor=axcolor)
-        axbn = plt.axes([0.205,   0.20, 0.04, 0.03], facecolor=axcolor)
-        axbt = plt.axes([0.249,   0.20, 0.04, 0.03], frameon=False)
+        axbp = plt.axes([0.125,   0.21, 0.04, 0.03], facecolor=axcolor)
+        axbr = plt.axes([0.165,   0.21, 0.04, 0.03], facecolor=axcolor)
+        axbn = plt.axes([0.205,   0.21, 0.04, 0.03], facecolor=axcolor)
+        axbt = plt.axes([0.249,   0.21, 0.04, 0.03], frameon=False)
         axbt.set_xticks([])
         axbt.set_yticks([])
-        rax1 = plt.axes([0.125, 0.12, 0.04, 0.07], facecolor=axcolor)
+        rax1 = plt.axes([0.125, 0.12, 0.04, 0.09], facecolor=axcolor)
         rax1.text(0.5, -0.3, r'Data',  ha='center')
-        rax2 = plt.axes([0.165, 0.12, 0.04, 0.07], facecolor=axcolor)
+        rax2 = plt.axes([0.165, 0.12, 0.04, 0.09], facecolor=axcolor)
         rax2.text(0.5, -0.3, r'Mask',  ha='center')
-        rax3 = plt.axes([0.205, 0.12, 0.04, 0.07], facecolor=axcolor)
-        rax3.text(0.5, -0.3, r'Options', ha='center')
+        rax3 = plt.axes([0.205, 0.12, 0.04, 0.09], facecolor=axcolor)
+        rax3.text(0.5, -0.3, r'Tags', ha='center')
         null_label = axbt.text(0,0,'')
 
-        mask_key='hqv_msk'
-        mask_opts='Disable'
+        mask_key=None
+        tags_key='All'
         data_key='slog10q'
-        inv_mask=False
-        draw_params={'rr':rr, 'th':th, 'ph':ph, 'mask_key':mask_key, 'data_key':data_key, 'mask_opts':mask_opts, 'cst_mask':cst_mask}
+        draw_params={'rr':rr, 'th':th, 'ph':ph, 'mask_key':mask_key, 'data_key':data_key, 'tags_key':tags_key}
+
+        imsk = np.sum([el.hqv_msk for el in self.result.interior_HQVs], axis=0).astype('bool')
+        smsk = np.sum([self.get_reg_hqv(labels = el.labels) for el in self.result.exterior_HQVs if el.simple], axis=0).astype('bool')
+        bmsk = np.sum([self.get_reg_hqv(labels = el.labels) for el in self.result.exterior_HQVs if el.branch], axis=0).astype('bool')
+        vmsk = np.sum([self.get_reg_hqv(labels = el.labels) for el in self.result.exterior_HQVs if el.vertex], axis=0).astype('bool')
+        hmsk = np.zeros(vmsk.shape, dtype='bool')
+        for obj in [el for el in self.result.exterior_HQVs if el.hybrid]:
+                    ext_msk = self.get_reg_hqv(labels = obj.labels)
+                    int_msk = np.sum([el.hqv_msk for el in obj.associated_intHQVs], axis=0).astype('bool')
+                    hmsk = hmsk | (ext_msk | int_msk)
+        del(ext_msk, int_msk)
 
         def redraw():
 
@@ -2403,8 +2473,8 @@ class Model(object):
             ph = draw_params['ph']
             data_key = draw_params['data_key']
             mask_key = draw_params['mask_key']
-            mask_opts = draw_params['mask_opts']
-            cst_mask = draw_params['cst_mask']
+            tags_key = draw_params['tags_key']
+            
             # get coordinate indices
             if rr <= crr.min(): irr=0
             elif rr >= crr.max(): irr=-1
@@ -2422,8 +2492,9 @@ class Model(object):
             #th = cth[ith]
             #ph = cph[iph]
             lr=np.log(rr)*1.5/np.log(2.5)+1.
-            draw_params={'rr':rr, 'th':th, 'ph':ph, 'mask_key':mask_key, 'data_key':data_key, 'mask_opts':mask_opts, 'cst_mask':cst_mask}
+            draw_params={'rr':rr, 'th':th, 'ph':ph, 'mask_key':mask_key, 'data_key':data_key, 'tags_key':tags_key}
 
+            # choose data
             if hasattr(self.source, data_key):
                 dcube=getattr(self.source, data_key)
             if hasattr(self.result, data_key):
@@ -2441,28 +2512,39 @@ class Model(object):
                 ctable = self.segcmap()
                 msk_ctable = self.mskcmap('binary')
                 vrange = (dcube.min(), dcube.max())
+            elif data_key=='GlnQp':
+                ctable='bone'
+                msk_ctable = self.mskcmap('spring_r')
+                vrange = (-50,50)
             else:
                 print('unknown data key')
                 return
-            
+
+            # choose mask
             if mask_key is None:
+                dmask=np.zeros(dcube.shape, dtype='bool')
+            elif mask_key=='disable':
                 dmask=np.zeros(dcube.shape, dtype='bool')
             elif mask_key=='hqv_msk':
                 dmask = self.result.hqv_msk
             elif mask_key=='seg_msk':
                 dmask = ~self.result.seg_msk
-            elif mask_key=='custom':
-                if cst_mask is None:
-                    dmask=np.zeros(dcube.shape, dtype='bool')
-                else:
-                    dmask = cst_mask
-            else: pass
-            
-            if mask_opts=='Inverse':
-                dmask=~dmask
-            elif (mask_opts=='Disable') or (mask_opts is None):
-                dmask=np.zeros(dcube.shape, dtype='bool')
-            else: pass
+            elif mask_key=='PIL_msk':
+                dmask = self.result.PIL_msk
+
+            # filter mask against tags
+            if tags_key is 'all':
+                pass
+            elif tags_key=='intHQV':
+                dmask = dmask & imsk
+            elif tags_key=='simple':
+                dmask = dmask & smsk
+            elif tags_key=='branch':
+                dmask = dmask & bmsk
+            elif tags_key=='vertex':
+                dmask = dmask & vmsk
+            elif tags_key=='hybrid':
+                dmask = dmask & hmsk
 
             nonlocal im1, im2, im3, im1m, im2m, im3m, ch1a, ch1b, ch2a, ch2b, ch3a, ch3b, ar1, ar2, cbar, null_label
 
@@ -2515,6 +2597,8 @@ class Model(object):
                     cbarlabel='slog$_{10}Q_\perp$'
                 elif data_key == 'brr'  :
                     cbarlabel='$B_r$ [Gauss]'
+                elif data_key == 'GlnQp':
+                    cbarlabel='$r (d/dr) \ln Q_\perp$'
                     
             cbar.set_ticks(tickvals)
             cbar.ax.set_yticklabels(ticknames)
@@ -2522,83 +2606,77 @@ class Model(object):
 
             return 0
 
-        def update_rr_coord(val):
+        def update_rr_coord(val, wait=None):
             nonlocal draw_params, null_vis, null_ini, rr_nodraw
             draw_params['rr'] = srr.val
             if (not rr_nodraw): # behavior when resetting a single coordinate allows immediate redraw and logic
                 if (null_vis) & (not null_ini): null_vis=False
                 null_ini=False
-                redraw()
+                if not wait: redraw()
                 fig.canvas.draw_idle()
             else:
                 rr_nodraw=False # alternative behavior to suppress redraw and logic for multiple coordinate updates
-                #print('r redraw suppressed')
-                #print(null_vis)
             return
 
-        def update_th_coord(val):
+        def update_th_coord(val, wait=None):
             nonlocal draw_params, null_vis, null_ini, th_nodraw
             draw_params['th'] = sth.val
             if (not th_nodraw):
                 if (null_vis) & (not null_ini): null_vis=False
                 null_ini=False
-                redraw()
+                if not wait: redraw()
                 fig.canvas.draw_idle()
             else:
                 th_nodraw=False
-                #print('th redraw suppressed')
-                #print(null_vis)
             return
 
-        def update_ph_coord(val):
+        def update_ph_coord(val, wait=None):
             nonlocal draw_params, null_vis, null_ini, ph_nodraw
             draw_params['ph'] = sph.val
             if (not ph_nodraw):
                 if (null_vis) & (not null_ini): null_vis=False
                 null_ini=False
-                redraw()
+                if not wait: redraw()
                 fig.canvas.draw_idle()
-                #print('redrawing on ph update')
-                #print(null_vis)
             else:
                 ph_nodraw=False
             return
 
-        def update_mask_key(label):
+        def update_mask_key(label, wait=None):
             nonlocal draw_params
-            if label =='HQV':  draw_params['mask_key']='hqv_msk'
+            if label =='HQV':               draw_params['mask_key']='hqv_msk'
             if label =='$\delta \Omega_i$': draw_params['mask_key']='seg_msk'
-            if label =='custom':   draw_params['mask_key']='custom'
-            #print(mask_key)
-            redraw()
+            if label =='PIL':               draw_params['mask_key']='PIL_msk'
+            if label =='None':              draw_params['mask_key']='disable'
+            if not wait: redraw()
             fig.canvas.draw_idle()
 
-        def update_data_key(label):
+        def update_data_key(label, wait=None):
             nonlocal draw_params
-            if label=='$Q_\perp$':     draw_params['data_key']='slog10q'
-            if label=='$\Omega_i$':      draw_params['data_key']='vol_seg'
-            if label=='$B_r$': draw_params['data_key']='brr'
-            #print(data_key)
-            redraw()
+            if label=='$\lg_{10} Q_\perp$':    draw_params['data_key']='slog10q'
+            if label=='$\Omega_i$':            draw_params['data_key']='vol_seg'
+            if label=='$B_r$':                 draw_params['data_key']='brr'
+            if label=='G $\ln Q_\perp$':       draw_params['data_key']='GlnQp'
+            if not wait: redraw()
             fig.canvas.draw_idle()
 
-        def update_mask_opts(label):
+        def update_tags_key(label, wait=None):
             nonlocal draw_params
-            if label=='Inverse': draw_params['mask_opts']='Inverse'
-            if label=='Normal': draw_params['mask_opts']='Normal'
-            if label=='Disable': draw_params['mask_opts']='Disable'
-            #print(inv_msk)
-            redraw()
+            if label=='all':    draw_params['tags_key']='all'
+            if label=='intHQV': draw_params['tags_key']='intHQV'
+            if label=='simple': draw_params['tags_key']='simple'
+            if label=='branch': draw_params['tags_key']='branch'
+            if label=='vertex': draw_params['tags_key']='vertex'
+            if label=='hybrid': draw_params['tags_key']='hybrid'
+            update_mask_key(label='HQV', wait=True)
+            if not wait: redraw()
             fig.canvas.draw_idle()
 
         def increase_null_pos(value):
             nonlocal c_null, null_vis, null_ini, rr_nodraw, th_nodraw
             null_ini=True
-            #print(null_vis)
             if (not null_vis): null_vis=True
             else: c_null = (c_null - 1)%N_null
-            #print(null_vis)
-            #print(c_null)
             rr_nodraw=True
             th_nodraw=True
             srr.set_val(P_null[c_null,2])
@@ -2608,11 +2686,8 @@ class Model(object):
         def decrease_null_pos(value):
             nonlocal c_null, null_vis, null_ini, rr_nodraw, th_nodraw
             null_ini=True
-            #print(null_vis)
             if (not null_vis): null_vis=True
             else: c_null = (c_null + 1)%N_null
-            #print(null_vis)
-            #print(c_null)
             rr_nodraw=True
             th_nodraw=True
             srr.set_val(P_null[c_null,2])
@@ -2631,12 +2706,12 @@ class Model(object):
         sth = Slider(axth, r'$\theta$', -88., 88.,  valinit=th, valfmt="%2.1f")
         sph = Slider(axph, r'$\phi$'  ,  0.0, 360., valinit=ph, valfmt="%2.0f")
 
-        data_selector_button = RadioButtons(rax1, (r'$\Omega_i$', r'$Q_\perp$', r'$B_r$'), active=1)    
-        mask_selector_button = RadioButtons(rax2, (r'$\delta \Omega_i$', r'HQV', r'custom'), active=1)
-        inv_maskersion_button = RadioButtons(rax3, (r'Inverse', r'Disable', r'Normal'), active=1)
+        data_selector_button  = RadioButtons(rax1, (r'$\lg_{10} Q_\perp$', r'G $\ln Q_\perp$', r'$\Omega_i$', r'$B_r$'), active=0)    
+        mask_selector_button  = RadioButtons(rax2, (r'None', r'HQV', r'$\delta \Omega_i$', r'PIL'), active=0)
+        tags_selector_button = RadioButtons(rax3, (r'all', r'intHQV', r'simple', r'branch', r'vertex', r'hybrid'), active=0)
 
-        null_inc_button = Button(axbn, 'next', color='w', hovercolor='b')
-        null_dec_button = Button(axbp, 'prev', color='w', hovercolor='b')
+        null_inc_button = Button(axbn, 'down', color='w', hovercolor='b')
+        null_dec_button = Button(axbp, 'up', color='w', hovercolor='b')
         reset_button = Button(axbr, 'null', color='r', hovercolor='b')
         null_vis=False
         null_ini=False
@@ -2656,13 +2731,13 @@ class Model(object):
 
         data_selector_button.on_clicked(update_data_key)
         mask_selector_button.on_clicked(update_mask_key)
-        inv_maskersion_button.on_clicked(update_mask_opts)
+        tags_selector_button.on_clicked(update_tags_key)
 
         #rrbox.on_submit(subrr)
         #thbox.on_submit(subth)
         #phbox.on_submit(subph)
 
-        io_objects = (data_selector_button, mask_selector_button, inv_maskersion_button, null_inc_button, null_dec_button, reset_button)
+        io_objects = (data_selector_button, mask_selector_button, tags_selector_button, null_inc_button, null_dec_button, reset_button)
 
         return fig, io_objects
 
