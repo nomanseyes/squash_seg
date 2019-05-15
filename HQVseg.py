@@ -109,7 +109,8 @@ class Source(object):
     # a class object for tholding the source data and numerical grid #
     ##################################################################
 
-    def __init__(self, crr=None, cth=None, cph=None, brr=None, bth=None, bph=None, slog10q=None):
+    def __init__(self, crr=None, cth=None, cph=None, brr=None, bth=None, bph=None,  \
+                 n_brr_bp=None, n_brr_bn=None, n_brr_tp=None, n_brr_tn=None, slog10q=None):
 
         # these are the basic model data: coordinates, bfield, slog10q
 
@@ -121,6 +122,11 @@ class Source(object):
         self.bth=bth
         self.bph=bph
 
+        self.n_brr_bp=n_brr_bp
+        self.n_brr_bn=n_brr_bn
+        self.n_brr_tp=n_brr_tp
+        self.n_brr_tn=n_brr_tn
+        
         self.slog10q=slog10q
 
         # we will also keep the local coordinate gradients
@@ -144,7 +150,7 @@ class Result(object):
     # a class object for tholding the results of the segmentation etc. #
     ####################################################################
 
-    def __init__(self, hqv_msk=None, PIL_msk=None, GlnQp=None, reg_width=None, hqv_width=None, pad_msk=None, \
+    def __init__(self, hqv_msk=None, PIL_ph=None, PIL_th=None, PIL_rr=None, GlnQp=None, reg_width=None, hqv_width=None, pad_msk=None, \
                  vol_seg=None, seg_msk=None, adj_msk=None, exterior_HQVs=None, interior_HQVs=None, \
                  null_to_region_dist=None, null_to_intHQV_dist=None, null_info=None, \
                  open_labels=None, clsd_labels=None, opos_labels=None, oneg_labels=None, labels=None):
@@ -154,7 +160,9 @@ class Result(object):
         # these come from the mask building
 
         self.hqv_msk            =hqv_msk
-        self.PIL_msk            =PIL_msk
+        self.PIL_ph             =PIL_ph
+        self.PIL_th             =PIL_th
+        self.PIL_rr             =PIL_rr
         self.GlnQp              =GlnQp
 
         # these attributes come from the original segmentation
@@ -441,6 +449,7 @@ class Model(object):
         import numpy as np
         import pandas as pd
         import os
+        import skimage.measure as skim
 
         # allows generalization for other data formats
         if not self.inputs.protocol: self.inputs.protocol='standard_QSLsquasher'
@@ -495,6 +504,13 @@ class Model(object):
                     b_th_nat = np.append(np.append(np.mean(b_th_nat[:,0,:], axis=0)*np.ones((nx,1,1)), b_th_nat, axis=1), np.mean(b_th_nat[:,-1,:], axis=0)*np.ones((nx,1,1)), axis=1)
                     b_rr_nat = np.append(np.append(np.mean(b_rr_nat[:,0,:], axis=0)*np.ones((nx,1,1)), b_rr_nat, axis=1), np.mean(b_rr_nat[:,-1,:], axis=0)*np.ones((nx,1,1)), axis=1)
 
+            print('Checking Unipolar Regions')
+            
+            self.source.n_brr_bp = np.max(skim.label(b_rr_nat[..., 0] > 0))
+            self.source.n_brr_bn = np.max(skim.label(b_rr_nat[..., 0] < 0))
+            self.source.n_brr_tp = np.max(skim.label(b_rr_nat[...,-1] > 0))
+            self.source.n_brr_tn = np.max(skim.label(b_rr_nat[...,-1] < 0))
+
             print('Interpolating B onto Q grid')
 
             b_coords = [ph_mag, th_mag, rr_mag]
@@ -548,9 +564,28 @@ class Model(object):
         from skimage import morphology as mor
 
         # first get the PIL just for later use
-        print('Building PIL mask')
-        dbr_dph, dbr_dth, dbr_drr = np.gradient(self.source.brr, np.pi*self.source.cph[:,0,0]/180, np.pi*self.source.cth[0,:,0]/180, self.source.crr[0,0,:], axis=(0,1,2))
-        self.result.PIL_msk = (self.source.crr**2 * (dbr_dph**2 + dbr_dth**2 + dbr_drr**2) > 10**10 * self.source.brr**2)
+        print('Building PIL masks')
+        # bph -- derivs in rr and th
+        dbph_dph, dbph_dth, dbph_drr = np.gradient(self.source.bph, np.pi*self.source.cph[:,0,0]/180, np.pi*self.source.cth[0,:,0]/180, self.source.crr[0,0,:], axis=(0,1,2))
+        gdn_bph_ph = dbph_dph / np.cos(np.pi * self.source.cth / 180)
+        gdn_bph_th = dbph_dth
+        gdn_bph_rr = dbph_drr * self.source.crr
+        self.result.PIL_ph = ( (gdn_bph_th**2 + gdn_bph_rr**2) > 10**4 * self.source.bph**2 )
+        del(dbph_dph, dbph_dth, dbph_drr, gdn_bph_ph, gdn_bph_th, gdn_bph_rr)
+        # bth -- derivs in rr and ph
+        dbth_dph, dbth_dth, dbth_drr = np.gradient(self.source.bth, np.pi*self.source.cph[:,0,0]/180, np.pi*self.source.cth[0,:,0]/180, self.source.crr[0,0,:], axis=(0,1,2))
+        gdn_bth_ph = dbth_dph / np.cos(np.pi * self.source.cth / 180)
+        gdn_bth_th = dbth_dth
+        gdn_bth_rr = dbth_drr * self.source.crr
+        self.result.PIL_th = ( (gdn_bth_ph**2 + gdn_bth_rr**2) > 10**4 * self.source.bth**2 )
+        del(dbth_dph, dbth_dth, dbth_drr, gdn_bth_ph, gdn_bth_th, gdn_bth_rr)
+        # brr
+        dbrr_dph, dbrr_dth, dbrr_drr = np.gradient(self.source.brr, np.pi*self.source.cph[:,0,0]/180, np.pi*self.source.cth[0,:,0]/180, self.source.crr[0,0,:], axis=(0,1,2))
+        gdn_brr_ph = dbrr_dph / np.cos(np.pi * self.source.cth / 180)
+        gdn_brr_th = dbrr_dth
+        gdn_brr_rr = dbrr_drr * self.source.crr
+        self.result.PIL_rr = ( (gdn_brr_ph**2 + gdn_brr_th**2) > 10**4 * self.source.brr**2 )
+        del(dbrr_dph, dbrr_dth, dbrr_drr, gdn_brr_ph, gdn_brr_th, gdn_brr_rr)
         
         ### get the derivs.
         ### normalize derivs. want r*grad so deriv scales to radius
@@ -1332,6 +1367,7 @@ class Model(object):
                     print('                               ...testing pair:', group_labels, '          ',end='\r')
                     hqv = self.get_reg_hqv(labels=group_labels)
                     top = (np.sum(hqv[...,-1]) > 0)
+                    bot = (np.sum(hqv[..., 0]) > 0)
                     vol = np.int32(np.sum(hqv))
                     pole = bool(hqv[:,0,:].max() | hqv[:,-1,:].max())
                     if vol > 0:
@@ -1361,6 +1397,7 @@ class Model(object):
                         setattr(new_group_obj, 'volume',     vol)
                         setattr(new_group_obj, 'vol_frac',   vol_frac)
                         setattr(new_group_obj, 'top',        top)
+                        setattr(new_group_obj, 'bot',        bot)
                         setattr(new_group_obj, 'pole',       pole)
                         setattr(new_group_obj, 'opos',       opos)
                         setattr(new_group_obj, 'oneg',       oneg)
@@ -1403,6 +1440,7 @@ class Model(object):
                     if all_parents_exist: # if all the parent elements are present, there could be a child intersection:
                         hqv = self.get_reg_hqv(labels=group_labels)
                         top = (np.sum(hqv[...,-1]) > 0)
+                        bot = (np.sum(hqv[..., 0]) > 0)
                         vol = np.int32(np.sum(hqv))
                         pole = (hqv[:,0,:].max() | hqv[:,-1,:].max())
                         if vol > 0:
@@ -1432,6 +1470,7 @@ class Model(object):
                             setattr(new_group_obj, 'volume',     vol)
                             setattr(new_group_obj, 'vol_frac',   vol_frac)
                             setattr(new_group_obj, 'top',        top)
+                            setattr(new_group_obj, 'bot',        bot)
                             setattr(new_group_obj, 'pole',       pole)
                             setattr(new_group_obj, 'opos',       opos)
                             setattr(new_group_obj, 'oneg',       oneg)
@@ -1574,10 +1613,12 @@ class Model(object):
                             submask = (subvols==sublabels[i])
                             fully_detached = not bool( ( submask & reg_ifc ).max() ) 
                             polar_artefact = ( bool( submask[:,0,:].max() ) | bool( submask[:,-1,:].max() ) )
+                            bot = ( np.sum(submask[..., 0]) > 0 )
                             hqv_obj = Foo()
-                            setattr(hqv_obj, 'label', reg)
-                            setattr(hqv_obj, 'sublabel', sublabels[i])
-                            setattr(hqv_obj, 'hqv_msk', submask)
+                            setattr(hqv_obj, 'bot',            bot)
+                            setattr(hqv_obj, 'label',          reg)
+                            setattr(hqv_obj, 'sublabel',       sublabels[i])
+                            setattr(hqv_obj, 'hqv_msk',        submask)
                             setattr(hqv_obj, 'fully_detached', fully_detached)
                             setattr(hqv_obj, 'polar_artefact', polar_artefact)
                             group_list.append(hqv_obj)
@@ -1943,12 +1984,13 @@ class Model(object):
             int_hqv_obj = self.result.interior_HQVs[int_idx]
             for ext_idx in range(n_ext):
                 ext_hqv_obj = self.result.exterior_HQVs[ext_idx]
-                if (int_hqv_obj.label in ext_hqv_obj.labels) and not ext_hqv_obj.clsd:
+                if (int_hqv_obj.label in ext_hqv_obj.labels) and (ext_hqv_obj.opos or ext_hqv_obj.oneg):
                     # check if all parents are  already associated with this int_hqv
+                    # this shortest list of regions that need testing bc logicall the intersection of groups cannot be in if all groups are not already in
                     all_parents_in = True
                     for parent_idx in ext_hqv_obj.parents:
                         all_parents_in = all_parents_in * (self.result.exterior_HQVs[parent_idx] in int_hqv_obj.associated_extHQVs)
-                    # we test if the parents are in (or if there are no parents)
+                    # if parents are in (or if there are no parents) we test the group
                     if ((ext_hqv_obj.n_regs == 2) or all_parents_in):
                         if (np.sum( int_hqv_obj.hqv_msk & self.get_reg_hqv(labels = ext_hqv_obj.labels) ) > 0):
                             print('... overlap found for ',int_hqv_obj.label,':',int_hqv_obj.sublabel,' against ',ext_hqv_obj.labels,'...')
@@ -2308,7 +2350,7 @@ class Model(object):
             print('argument must be a colarmap name string')
             return
         mskcmap = base_cmap(np.arange(base_cmap.N))
-        mskcmap[:,-1]=np.linspace(0,1,base_cmap.N)
+        mskcmap[:,-1]=(np.linspace(0,1,base_cmap.N)>0.5).astype('float')
         mskcmap=ListedColormap(mskcmap)
 
         return mskcmap
@@ -2379,19 +2421,23 @@ class Model(object):
         ph = cph[iph]
         rr0, th0, ph0 = rr, th, ph
 
-        dcube = self.source.slog10q
-        dmask = np.zeros(dcube.shape, dtype='bool')
+        dcube_rr = self.source.slog10q
+        dcube_th = self.source.slog10q
+        dcube_ph = self.source.slog10q
+        dmask_rr = np.zeros(dcube_rr.shape, dtype='bool')
+        dmask_th = dmask_rr
+        dmask_ph = dmask_rr
         ctable ='viridis'
         msk_ctable = self.mskcmap('spring_r')
         vrange = (-4,4)
 
         fig, axes = plt.subplots(num=window, nrows=2, ncols=2, gridspec_kw={'height_ratios': [(th_max-th_min),1.5*180/np.pi], 'width_ratios': [1.5*180/np.pi,(ph_max-ph_min)]})
-        im1 = axes[0,0].imshow((dcube)[iph,:,:]  , vmin=vrange[0], vmax=vrange[1], cmap=ctable, extent=[rr_min,rr_max,th_min,th_max], origin='lower', aspect=(np.pi/180))
-        im2 = axes[0,1].imshow((dcube)[:,:,irr].T, vmin=vrange[0], vmax=vrange[1], cmap=ctable, extent=[ph_min,ph_max,th_min,th_max], origin='lower', aspect=(1.))
-        im3 = axes[1,1].imshow((dcube)[:,ith,:].T, vmin=vrange[0], vmax=vrange[1], cmap=ctable, extent=[ph_min,ph_max,rr_min,rr_max], origin='lower', aspect=(180./np.pi))
-        im1m = axes[0,0].imshow((dmask)[iph,:,:]  , vmin=0, vmax=1, cmap=msk_ctable, extent=[rr_min,rr_max,th_min,th_max], origin='lower', aspect=(np.pi/180))
-        im2m = axes[0,1].imshow((dmask)[:,:,irr].T, vmin=0, vmax=1, cmap=msk_ctable, extent=[ph_min,ph_max,th_min,th_max], origin='lower', aspect=(1.))
-        im3m = axes[1,1].imshow((dmask)[:,ith,:].T, vmin=0, vmax=1, cmap=msk_ctable, extent=[ph_min,ph_max,rr_min,rr_max], origin='lower', aspect=(180./np.pi))
+        im1 = axes[0,0].imshow((dcube_ph)[iph,:,:]  , vmin=vrange[0], vmax=vrange[1], cmap=ctable, extent=[rr_min,rr_max,th_min,th_max], origin='lower', aspect=(np.pi/180))
+        im2 = axes[0,1].imshow((dcube_rr)[:,:,irr].T, vmin=vrange[0], vmax=vrange[1], cmap=ctable, extent=[ph_min,ph_max,th_min,th_max], origin='lower', aspect=(1.))
+        im3 = axes[1,1].imshow((dcube_th)[:,ith,:].T, vmin=vrange[0], vmax=vrange[1], cmap=ctable, extent=[ph_min,ph_max,rr_min,rr_max], origin='lower', aspect=(180./np.pi))
+        im1m = axes[0,0].imshow((dmask_ph)[iph,:,:]  , vmin=0, vmax=1, cmap=msk_ctable, extent=[rr_min,rr_max,th_min,th_max], origin='lower', aspect=(np.pi/180))
+        im2m = axes[0,1].imshow((dmask_rr)[:,:,irr].T, vmin=0, vmax=1, cmap=msk_ctable, extent=[ph_min,ph_max,th_min,th_max], origin='lower', aspect=(1.))
+        im3m = axes[1,1].imshow((dmask_th)[:,ith,:].T, vmin=0, vmax=1, cmap=msk_ctable, extent=[ph_min,ph_max,rr_min,rr_max], origin='lower', aspect=(180./np.pi))
         if self.inputs.vis_title is not None:
             try: fig.suptitle(r'{0}'.format(self.inputs.vis_title), x=0.55, y=0.92, ha='center', fontsize=24)
             except: pass
@@ -2495,24 +2541,32 @@ class Model(object):
             draw_params={'rr':rr, 'th':th, 'ph':ph, 'mask_key':mask_key, 'data_key':data_key, 'tags_key':tags_key}
 
             # choose data
-            if hasattr(self.source, data_key):
-                dcube=getattr(self.source, data_key)
-            if hasattr(self.result, data_key):
-                dcube=getattr(self.result, data_key)
-            if data_key=='brr':
+            if data_key=='bn':
+                dcube_rr=getattr(self.source, 'brr')
+                dcube_th=getattr(self.source, 'bth')
+                dcube_ph=getattr(self.source, 'bph')
                 ctable='bwr_r'
                 msk_ctable = self.mskcmap('binary')
-                brms= np.around(np.sqrt((self.source.brr[...,irr]**2).mean()), decimals=2)
+                brms= np.around(np.max((np.sqrt((self.source.brr[...,irr]**2).mean()), 0.1)), decimals=2)
                 vrange = (-brms, brms)
             elif data_key=='slog10q':
+                dcube_rr=getattr(self.source, 'slog10q')
+                dcube_th=getattr(self.source, 'slog10q')
+                dcube_ph=getattr(self.source, 'slog10q')
                 ctable='viridis'
                 msk_ctable = self.mskcmap('spring_r')
                 vrange = (-4,4)
             elif data_key=='vol_seg':
+                dcube_rr=getattr(self.result, 'vol_seg')
+                dcube_th=getattr(self.result, 'vol_seg')
+                dcube_ph=getattr(self.result, 'vol_seg')
                 ctable = self.segcmap()
                 msk_ctable = self.mskcmap('binary')
-                vrange = (dcube.min(), dcube.max())
+                vrange = (dcube_rr.min(), dcube_rr.max())
             elif data_key=='GlnQp':
+                dcube_rr=getattr(self.result, 'GlnQp')
+                dcube_th=getattr(self.result, 'GlnQp')
+                dcube_ph=getattr(self.result, 'GlnQp')
                 ctable='bone'
                 msk_ctable = self.mskcmap('spring_r')
                 vrange = (-50,50)
@@ -2522,29 +2576,49 @@ class Model(object):
 
             # choose mask
             if mask_key is None:
-                dmask=np.zeros(dcube.shape, dtype='bool')
+                dmask_ph=np.zeros(dcube_rr.shape, dtype='bool')
+                dmask_th=dmask_ph
+                dmask_rr=dmask_ph
             elif mask_key=='disable':
-                dmask=np.zeros(dcube.shape, dtype='bool')
+                dmask_ph=np.zeros(dcube_rr.shape, dtype='bool')
+                dmask_th=dmask_ph
+                dmask_rr=dmask_ph
             elif mask_key=='hqv_msk':
-                dmask = self.result.hqv_msk
+                dmask_ph=self.result.hqv_msk
+                dmask_th=dmask_ph
+                dmask_rr=dmask_ph
             elif mask_key=='seg_msk':
                 dmask = ~self.result.seg_msk
+                dmask_th=dmask_ph
+                dmask_rr=dmask_ph
             elif mask_key=='PIL_msk':
-                dmask = self.result.PIL_msk
+                dmask_ph=self.result.PIL_ph
+                dmask_th=self.result.PIL_th
+                dmask_rr=self.result.PIL_rr
 
             # filter mask against tags
             if tags_key is 'all':
                 pass
             elif tags_key=='intHQV':
-                dmask = dmask & imsk
+                dmask_ph=dmask_ph & imsk
+                dmask_th=dmask_th & imsk
+                dmask_rr=dmask_rr & imsk
             elif tags_key=='simple':
-                dmask = dmask & smsk
+                dmask_ph=dmask_ph & smsk
+                dmask_th=dmask_th & smsk
+                dmask_rr=dmask_rr & smsk
             elif tags_key=='branch':
-                dmask = dmask & bmsk
+                dmask_ph=dmask_ph & bmsk
+                dmask_th=dmask_th & bmsk
+                dmask_rr=dmask_rr & bmsk
             elif tags_key=='vertex':
-                dmask = dmask & vmsk
+                dmask_ph=dmask_ph & vmsk
+                dmask_th=dmask_th & vmsk
+                dmask_rr=dmask_rr & vmsk
             elif tags_key=='hybrid':
-                dmask = dmask & hmsk
+                dmask_ph=dmask_ph & hmsk
+                dmask_th=dmask_th & hmsk
+                dmask_rr=dmask_rr & hmsk
 
             nonlocal im1, im2, im3, im1m, im2m, im3m, ch1a, ch1b, ch2a, ch2b, ch3a, ch3b, ar1, ar2, cbar, null_label
 
@@ -2552,16 +2626,16 @@ class Model(object):
             im2.set_cmap(ctable)
             im3.set_cmap(ctable)
 
-            im1.set_data(dcube[iph,:,:])
-            im2.set_data(dcube[:,:,irr].T)
-            im3.set_data(dcube[:,ith,:].T)
+            im1.set_data(dcube_ph[iph,:,:])
+            im2.set_data(dcube_rr[:,:,irr].T)
+            im3.set_data(dcube_th[:,ith,:].T)
             im1.set_clim(vmin=vrange[0], vmax=vrange[1])
             im2.set_clim(vmin=vrange[0], vmax=vrange[1])
             im3.set_clim(vmin=vrange[0], vmax=vrange[1])
 
-            im1m.set_data(dmask[iph,:,:])
-            im2m.set_data(dmask[:,:,irr].T)
-            im3m.set_data(dmask[:,ith,:].T)
+            im1m.set_data(dmask_ph[iph,:,:])
+            im2m.set_data(dmask_rr[:,:,irr].T)
+            im3m.set_data(dmask_th[:,ith,:].T)
 
             im1m.set_cmap(msk_ctable)
             im2m.set_cmap(msk_ctable)
@@ -2587,22 +2661,24 @@ class Model(object):
 
 
             if data_key == 'vol_seg':
-                tickvals = [dcube.min(), dcube.max()]
-                ticknames = ['open', 'closed']
+                tickvals = [dcube_rr.min()/1.5, 0, dcube_rr.max()/1.5]
+                ticknames = [r'Open', r'Mask', r'Closed']
                 cbarlabel = ''
+                cbar.set_ticks(tickvals)
+                cbar.ax.set_yticklabels(ticknames, rotation=90,  verticalalignment='center', fontsize=20)
+                cbar.set_label(r'{0}'.format(cbarlabel), rotation=90, fontsize=20)
             else:
-                tickvals = np.linspace(vrange[0], vrange[1], 5)
+                tickvals = np.linspace(vrange[0], vrange[1], 3)
                 ticknames = ['{:2.1f}'.format(i) for i in tickvals]
                 if data_key == 'slog10q':
                     cbarlabel='slog$_{10}Q_\perp$'
-                elif data_key == 'brr'  :
-                    cbarlabel='$B_r$ [Gauss]'
+                elif data_key == 'bn'  :
+                    cbarlabel='$B_n$ [Gauss]'
                 elif data_key == 'GlnQp':
                     cbarlabel='$r (d/dr) \ln Q_\perp$'
-                    
-            cbar.set_ticks(tickvals)
-            cbar.ax.set_yticklabels(ticknames)
-            cbar.set_label(r'{0}'.format(cbarlabel), rotation=90, fontsize=20)
+                cbar.set_ticks(tickvals)
+                cbar.ax.set_yticklabels(ticknames)
+                cbar.set_label(r'{0}'.format(cbarlabel), rotation=90, fontsize=20)
 
             return 0
 
@@ -2655,7 +2731,7 @@ class Model(object):
             nonlocal draw_params
             if label=='$\lg_{10} Q_\perp$':    draw_params['data_key']='slog10q'
             if label=='$\Omega_i$':            draw_params['data_key']='vol_seg'
-            if label=='$B_r$':                 draw_params['data_key']='brr'
+            if label=='$B_n$':                 draw_params['data_key']='bn'
             if label=='G $\ln Q_\perp$':       draw_params['data_key']='GlnQp'
             if not wait: redraw()
             fig.canvas.draw_idle()
@@ -2706,7 +2782,7 @@ class Model(object):
         sth = Slider(axth, r'$\theta$', -88., 88.,  valinit=th, valfmt="%2.1f")
         sph = Slider(axph, r'$\phi$'  ,  0.0, 360., valinit=ph, valfmt="%2.0f")
 
-        data_selector_button  = RadioButtons(rax1, (r'$\lg_{10} Q_\perp$', r'G $\ln Q_\perp$', r'$\Omega_i$', r'$B_r$'), active=0)    
+        data_selector_button  = RadioButtons(rax1, (r'$\lg_{10} Q_\perp$', r'G $\ln Q_\perp$', r'$\Omega_i$', r'$B_n$'), active=0)    
         mask_selector_button  = RadioButtons(rax2, (r'None', r'HQV', r'$\delta \Omega_i$', r'PIL'), active=0)
         tags_selector_button = RadioButtons(rax3, (r'all', r'intHQV', r'simple', r'branch', r'vertex', r'hybrid'), active=0)
 
