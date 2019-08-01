@@ -283,7 +283,7 @@ class Model(object):
 
     def do_segment(self):
         self.build_masks()
-        self.segment_volume(visualize=True)
+        self.segment_volume()
 
     def do_itemize(self):
         self.determine_adjacency()
@@ -484,6 +484,32 @@ class Model(object):
                     print('Nan found in Brr')
                 return
 
+            # get list of nulls #
+            find_nulls=True
+            import_nulls=False
+            if find_nulls:
+                print('Detecting Nulls')
+                new_null_list = null_finder(nx, ny, nz, ph_mag, np.sin(th_mag*np.pi/180.), np.log(rr_mag/self.inputs.solrad), b_ph_nat, b_th_nat, b_rr_nat, tolerance=10**-8)
+                null_list_sort_ind = np.argsort([el['z'] for el in new_null_list])
+                null_rr = [new_null_list[ind]['z'] for ind in null_list_sort_ind] 
+                null_th = [new_null_list[ind]['y'] for ind in null_list_sort_ind]
+                null_ph = [new_null_list[ind]['x'] for ind in null_list_sort_ind]
+                self.source.null_locs = np.array([null_ph, np.arcsin(null_th)*180./np.pi, np.exp(null_rr)])
+            elif import_nulls:
+                print('Importing Null Locations \n%%%%%%%%%%%%%%%%%%%%%%%%%%%%')
+                null_loc_fname = self.inputs.b_dir+'/nullpositions.dat'
+                if os.path.isfile(null_loc_fname):
+                    from scipy.io import readsav
+                    null_dict=readsav(null_loc_fname, python_dict=True)
+                    self.source.null_locs=null_dict['nulls'].astype('float32')
+                    P_null=self.source.null_locs.T
+                    P_null=P_null[np.argsort(P_null[:,2]),:]
+                    self.source.null_locs = P_null.T
+                    print('Null list imported.')
+                else:
+                    print('Null list not found -- inserting dummy entry')
+                    self.source.null_locs = np.array([[0],[0],[0]])
+
             ###### global models exclude ph=360 from the source field but include it in the q output.
             ###### global models also exclude the poles. We reintroduce these, setting the pole equal to the ave.
             if self.inputs.glbl_mdl!=False:
@@ -503,7 +529,7 @@ class Model(object):
                     b_ph_nat = np.append(np.append(np.mean(b_ph_nat[:,0,:], axis=0)*np.ones((nx,1,1)), b_ph_nat, axis=1), np.mean(b_ph_nat[:,-1,:], axis=0)*np.ones((nx,1,1)), axis=1)
                     b_th_nat = np.append(np.append(np.mean(b_th_nat[:,0,:], axis=0)*np.ones((nx,1,1)), b_th_nat, axis=1), np.mean(b_th_nat[:,-1,:], axis=0)*np.ones((nx,1,1)), axis=1)
                     b_rr_nat = np.append(np.append(np.mean(b_rr_nat[:,0,:], axis=0)*np.ones((nx,1,1)), b_rr_nat, axis=1), np.mean(b_rr_nat[:,-1,:], axis=0)*np.ones((nx,1,1)), axis=1)
-
+                
             print('Checking Unipolar Regions')
             
             self.source.n_brr_bp = np.max(skim.label(b_rr_nat[..., 0] > 0))
@@ -523,18 +549,6 @@ class Model(object):
             self.source.bph = bph_interpolator(q_pts).T.reshape(self.source.cph.shape).astype('float32')
             self.source.bth = bth_interpolator(q_pts).T.reshape(self.source.cph.shape).astype('float32')
             self.source.brr = brr_interpolator(q_pts).T.reshape(self.source.cph.shape).astype('float32')
-            
-            print('Importing Null Locations \n%%%%%%%%%%%%%%%%%%%%%%%%%%%%')
-            null_loc_fname = self.inputs.b_dir+'/nullpositions.dat'
-            if os.path.isfile(null_loc_fname):
-                from scipy.io import readsav
-                null_dict=readsav(null_loc_fname, python_dict=True)
-                self.source.null_locs=null_dict['nulls'].astype('float32')
-                P_null=self.source.null_locs.T
-                P_null=P_null[np.argsort(P_null[:,2]),:]
-                self.source.null_locs = P_null.T
-                print('Null list imported.')
-            else: print('Null list not found!')
             
             print('Success              \n%%%%%%%%%%%%%%%%%%%%%%%%%%%%')
 
@@ -2509,7 +2523,8 @@ class Model(object):
                     ext_msk = self.get_reg_hqv(labels = obj.labels)
                     int_msk = np.sum([el.hqv_msk for el in obj.associated_intHQVs], axis=0).astype('bool')
                     hmsk = hmsk | (ext_msk | int_msk)
-        del(ext_msk, int_msk)
+        if 'ext_msk' in locals(): del(ext_msk)
+        if 'int_msk' in locals(): del(int_msk)
 
         def redraw():
 
@@ -2588,7 +2603,7 @@ class Model(object):
                 dmask_th=dmask_ph
                 dmask_rr=dmask_ph
             elif mask_key=='seg_msk':
-                dmask = ~self.result.seg_msk
+                dmask_ph=~self.result.seg_msk
                 dmask_th=dmask_ph
                 dmask_rr=dmask_ph
             elif mask_key=='PIL_msk':
@@ -2879,3 +2894,910 @@ def get_mask_boundary(mask):
     
 
 
+
+
+
+
+
+
+
+
+
+
+
+
+#### null finder routine from F. Chiti
+
+def null_finder(nx,ny,nz,xv,yv,zv,B_x1,B_y1,B_z1, tolerance=None):
+    #!/usr/bin/env python3
+    # -*- coding: utf-8 -*-
+    """
+    Created on Sun Jul  7 13:16:39 2019
+    
+    @author: federicachiti
+    """
+    
+    import numpy as np
+    import math
+    from numpy.linalg import inv
+
+    # creating the function that checks the existence of null points and localize them in the grid   
+
+    ### some auxiliary routines ###
+
+    def check_sign(vertices):
+        if len(vertices) < 1:
+            return True
+        return len(vertices) == vertices.count(vertices[0])
+   
+    def B_field(x,y,z,k): # k is the array of trilinear coefficients
+        #trilinear extrapolation
+        bx = k[0,0] + k[0,1]*x +k[0,2]*y + k[0,3]*x*y + k[0,4]*z + k[0,5]*x*z + k[0,6]*y*z + k[0,7]*x*y*z
+        by = k[1,0] + k[1,1]*x +k[1,2]*y + k[1,3]*x*y + k[1,4]*z + k[1,5]*x*z + k[1,6]*y*z + k[1,7]*x*y*z
+        bz = k[2,0] + k[2,1]*x +k[2,2]*y + k[2,3]*x*y + k[2,4]*z + k[2,5]*x*z + k[2,6]*y*z + k[2,7]*x*y*z
+      
+        #magnitude of B field at the location
+        magnitude = math.sqrt(bx*bx+by*by+bz*bz) 
+      
+        b = [magnitude,bx,by,bz]
+      
+        return(b)
+   
+
+    def jacobian(x,y,z,k):
+
+        dbxdx = k[0,1] + k[0,3]*y + k[0,5]*z + k[0,7]*y*z
+        dbxdy = k[0,2] + k[0,3]*x + k[0,6]*z + k[0,7]*x*z
+        dbxdz = k[0,4] + k[0,5]*x + k[0,6]*y + k[0,7]*x*y
+        
+        dbydx = k[1,1] + k[1,3]*y + k[1,5]*z + k[1,7]*y*z
+        dbydy = k[1,2] + k[1,3]*x + k[1,6]*z + k[1,7]*x*z
+        dbydz = k[1,4] + k[1,5]*x + k[1,6]*y + k[1,7]*x*y
+        
+        dbzdx = k[2,1] + k[2,3]*y + k[2,5]*z + k[2,7]*y*z
+        dbzdy = k[2,2] + k[2,3]*x + k[2,6]*z + k[2,7]*x*z
+        dbzdz = k[2,4] + k[2,5]*x + k[2,6]*y + k[2,7]*x*y
+        
+        jac = np.array([[dbxdx,dbxdy,dbxdz],[dbydx,dbydy,dbydz],[dbzdx,dbzdy,dbzdz]])
+        
+        return(jac)
+
+
+    # creating 3 functions that determines the bilinear coefficients according to the face that is being analysed
+
+    def x_face(coord,j,k):
+      
+        a1 = j[0] + j[1]*coord
+        a2 = k[0] + k[1]*coord
+      
+        b1 = j[2] + j[3]*coord
+        b2 = k[2] + k[3]*coord
+      
+        c1 = j[4] + j[5]*coord
+        c2 = k[4] + k[5]*coord
+      
+        d1 = j[6] + j[7]*coord
+        d2 = k[6] + k[7]*coord
+      
+        coeff = np.array([[a1,b1,c1,d1],[a2,b2,c2,d2]])
+      
+        return(coeff)
+   
+    def y_face(coord,j,k):
+      
+        a1 = j[0] + j[2]*coord
+        a2 = k[0] + k[2]*coord
+      
+        b1 = j[1] + j[3]*coord
+        b2 = k[1] + k[3]*coord
+      
+        c1 = j[4] + j[6]*coord
+        c2 = k[4] + k[6]*coord
+      
+        d1 = j[5] + j[7]*coord
+        d2 = k[5] + k[7]*coord
+      
+        coeff = np.array([[a1,b1,c1,d1],[a2,b2,c2,d2]])
+        
+        return(coeff)
+   
+    def z_face(coord,j,k):
+      
+        a1 = j[0] + j[4]*coord
+        a2 = k[0] + k[4]*coord
+      
+        b1 = j[1] + j[5]*coord
+        b2 = k[1] + k[5]*coord
+      
+        c1 = j[2] + j[6]*coord
+        c2 = k[2] + k[6]*coord
+
+        d1 = j[3] + j[7]*coord
+        d2 = k[3] + k[7]*coord
+      
+        coeff = np.array([[a1,b1,c1,d1],[a2,b2,c2,d2]])
+      
+        return(coeff)
+
+
+    # creating a function that returns the roots of a quadratic equation    
+    def quad_roots (k):
+
+        a = k[0,1]*k[1,3]-k[1,1]*k[0,3]
+        b = k[0,0]*k[1,3]-k[1,0]*k[0,3]+k[0,1]*k[1,2]-k[1,1]*k[0,2]
+        c = k[0,0]*k[1,2]-k[1,0]*k[0,2]
+
+        if (b*b-4*a*c)>0 and a !=0:
+
+            root1 = (-b+math.sqrt(b*b-4*a*c))/(2*a)
+            root2 = (-b-math.sqrt(b*b-4*a*c))/(2*a)
+
+            sol = np.array([root1,root2])
+
+            return(sol)
+
+    def field_sign_change (f):
+
+        # returns a mask of dim (nx-1, ny-1, nz-1).
+        # true implies that the component changes signs at one of the vertices of the rhs cell.
+        
+        p000 = (np.roll(f, (-0,-0,-0), axis=(0,1,2)) > 0)
+        p100 = (np.roll(f, (-1,-0,-0), axis=(0,1,2)) > 0)
+        p010 = (np.roll(f, (-0,-1,-0), axis=(0,1,2)) > 0)
+        p110 = (np.roll(f, (-1,-1,-0), axis=(0,1,2)) > 0)
+        p001 = (np.roll(f, (-0,-0,-1), axis=(0,1,2)) > 0)
+        p101 = (np.roll(f, (-1,-0,-1), axis=(0,1,2)) > 0)
+        p011 = (np.roll(f, (-0,-1,-1), axis=(0,1,2)) > 0)
+        p111 = (np.roll(f, (-1,-1,-1), axis=(0,1,2)) > 0)
+        
+        all_pos = (  p000 &  p100 &  p010 &  p110 &  p001 &  p101 &  p011 &  p111 )[:-1,:-1,:-1]
+        all_neg = ( ~p000 & ~p100 & ~p010 & ~p110 & ~p001 & ~p101 & ~p011 & ~p111 )[:-1,:-1,:-1]
+        
+        fsc = ( ~all_pos & ~all_neg )
+
+        #import pdb; pdb.set_trace()
+        
+        return(fsc)
+
+    null_list = []
+    num_nulls = 0
+    
+    if not tolerance: tolerance = 10**-5
+    # initializing counters to keep track of how many cells pass the reduction and the bilinear stages
+    reduction_pass = 0
+    bilinear_pass = 0
+
+    print('initiating null detection')
+    
+    bx_sc = field_sign_change(B_x1)
+    by_sc = field_sign_change(B_y1)
+    bz_sc = field_sign_change(B_z1)
+
+    ind_list = np.array(np.where(bx_sc & by_sc & bz_sc)).T
+
+    #print('finished with vertex detection')
+    
+    for ind in ind_list:
+    #for k in range(int(nz-1)):
+    #    for j in range(int(ny-1)):
+    #        for i in range(int(nx-1)):   
+
+        i = ind[0]
+        j = ind[1]
+        k = ind[2]
+
+        #investigating sign of B_x, B_y, B_z components at each corner of each cell
+        #print('testing for null at ',i,j,k,'                 ',end='\r')
+
+
+        bxsign = np.sign(B_x1[i:i+2, j:j+2, k:k+2]) 
+        check_x = (bxsign.min()==bxsign.max())  
+
+        bysign = np.sign(B_y1[i:i+2, j:j+2, k:k+2])
+        check_y = (bysign.min()==bysign.max())
+
+        bzsign = np.sign(B_z1[i:i+2, j:j+2, k:k+2])
+        check_z = (bzsign.min()==bzsign.max())
+
+        if ((not check_x) and (not check_y) and (not check_z)):
+
+            # print('sign test passed at',i,j,k)
+            # updating 'null' to keep track of how many cells pass the reduction stage
+            reduction_pass +=1
+
+            # trilinear interpolation
+
+            ax = (1/((xv[i]-xv[i+1])*(yv[j]-yv[j+1])*(zv[k]-zv[k+1])))*(B_x1[i,j,k+1]*xv[i+1]*yv[j+1]*zv[k]+B_x1[i,j+1,k]*xv[i+1]*yv[j]*zv[k+1]+B_x1[i+1,j,k]*xv[i]*yv[j+1]*zv[k+1]+B_x1[i+1,j+1,k+1]*xv[i]*yv[j]*zv[k]-B_x1[i,j,k]*xv[i+1]*yv[j+1]*zv[k+1]-B_x1[i,j+1,k+1]*xv[i+1]*yv[j]*zv[k]-B_x1[i+1,j,k+1]*xv[i]*yv[j+1]*zv[k]-B_x1[i+1,j+1,k]*xv[i]*yv[j]*zv[k+1])
+            bx = (1/((xv[i]-xv[i+1])*(yv[j]-yv[j+1])*(zv[k]-zv[k+1])))*(B_x1[i,j,k]*yv[j+1]*zv[k+1]-B_x1[i,j,k+1]*yv[j+1]*zv[k]-B_x1[i,j+1,k]*yv[j]*zv[k+1]+B_x1[i,j+1,k+1]*yv[j]*zv[k]-B_x1[i+1,j,k]*yv[j+1]*zv[k+1]+B_x1[i+1,j,k+1]*yv[j+1]*zv[k]+B_x1[i+1,j+1,k]*yv[j]*zv[k+1]-B_x1[i+1,j+1,k+1]*yv[j]*zv[k])
+            cx = (1/((xv[i]-xv[i+1])*(yv[j]-yv[j+1])*(zv[k]-zv[k+1])))*(B_x1[i,j,k]*xv[i+1]*zv[k+1]-B_x1[i,j,k+1]*xv[i+1]*zv[k]-B_x1[i,j+1,k]*xv[i+1]*zv[k+1]+B_x1[i,j+1,k+1]*xv[i+1]*zv[k]-B_x1[i+1,j,k]*xv[i]*zv[k+1]+B_x1[i+1,j,k+1]*xv[i]*zv[k]+B_x1[i+1,j+1,k]*xv[i]*zv[k+1]-B_x1[i+1,j+1,k+1]*xv[i]*zv[k])
+            dx = (1/((xv[i]-xv[i+1])*(yv[j]-yv[j+1])*(zv[k]-zv[k+1])))*(-B_x1[i,j,k]*zv[k+1]+B_x1[i,j,k+1]*zv[k]+B_x1[i,j+1,k]*zv[k+1]-B_x1[i,j+1,k+1]*zv[k]+B_x1[i+1,j,k]*zv[k+1]-B_x1[i+1,j,k+1]*zv[k]-B_x1[i+1,j+1,k]*zv[k+1]+B_x1[i+1,j+1,k+1]*zv[k])
+            ex = (1/((xv[i]-xv[i+1])*(yv[j]-yv[j+1])*(zv[k]-zv[k+1])))*(B_x1[i,j,k]*xv[i+1]*yv[j+1]-B_x1[i,j,k+1]*xv[i+1]*yv[j+1]-B_x1[i,j+1,k]*xv[i+1]*yv[j]+B_x1[i,j+1,k+1]*xv[i+1]*yv[j]-B_x1[i+1,j,k]*xv[i]*yv[j+1]+B_x1[i+1,j,k+1]*xv[i]*yv[j+1]+B_x1[i+1,j+1,k]*xv[i]*yv[j]-B_x1[i+1,j+1,k+1]*xv[i]*yv[j])
+            fx = (1/((xv[i]-xv[i+1])*(yv[j]-yv[j+1])*(zv[k]-zv[k+1])))*(-B_x1[i,j,k]*yv[j+1]+B_x1[i,j,k+1]*yv[j+1]+B_x1[i,j+1,k]*yv[j]-B_x1[i,j+1,k+1]*yv[j]+B_x1[i+1,j,k]*yv[j+1]-B_x1[i+1,j,k+1]*yv[j+1]-B_x1[i+1,j+1,k]*yv[j]+B_x1[i+1,j+1,k+1]*yv[j])
+            gx = (1/((xv[i]-xv[i+1])*(yv[j]-yv[j+1])*(zv[k]-zv[k+1])))*(-B_x1[i,j,k]*xv[i+1]+B_x1[i,j,k+1]*xv[i+1]+B_x1[i,j+1,k]*xv[i+1]-B_x1[i,j+1,k+1]*xv[i+1]+B_x1[i+1,j,k]*xv[i]-B_x1[i+1,j,k+1]*xv[i]-B_x1[i+1,j+1,k]*xv[i]+B_x1[i+1,j+1,k+1]*xv[i])
+            hx = (1/((xv[i]-xv[i+1])*(yv[j]-yv[j+1])*(zv[k]-zv[k+1])))*(B_x1[i,j,k]-B_x1[i,j,k+1]-B_x1[i,j+1,k]+B_x1[i,j+1,k+1]-B_x1[i+1,j,k]+B_x1[i+1,j,k+1]+B_x1[i+1,j+1,k]-B_x1[i+1,j+1,k+1])
+
+
+            ay = (1/((xv[i]-xv[i+1])*(yv[j]-yv[j+1])*(zv[k]-zv[k+1])))*(B_y1[i,j,k+1]*xv[i+1]*yv[j+1]*zv[k]+B_y1[i,j+1,k]*xv[i+1]*yv[j]*zv[k+1]+B_y1[i+1,j,k]*xv[i]*yv[j+1]*zv[k+1]+B_y1[i+1,j+1,k+1]*xv[i]*yv[j]*zv[k]-B_y1[i,j,k]*xv[i+1]*yv[j+1]*zv[k+1]-B_y1[i,j+1,k+1]*xv[i+1]*yv[j]*zv[k]-B_y1[i+1,j,k+1]*xv[i]*yv[j+1]*zv[k]-B_y1[i+1,j+1,k]*xv[i]*yv[j]*zv[k+1])
+            by = (1/((xv[i]-xv[i+1])*(yv[j]-yv[j+1])*(zv[k]-zv[k+1])))*(B_y1[i,j,k]*yv[j+1]*zv[k+1]-B_y1[i,j,k+1]*yv[j+1]*zv[k]-B_y1[i,j+1,k]*yv[j]*zv[k+1]+B_y1[i,j+1,k+1]*yv[j]*zv[k]-B_y1[i+1,j,k]*yv[j+1]*zv[k+1]+B_y1[i+1,j,k+1]*yv[j+1]*zv[k]+B_y1[i+1,j+1,k]*yv[j]*zv[k+1]-B_y1[i+1,j+1,k+1]*yv[j]*zv[k])
+            cy = (1/((xv[i]-xv[i+1])*(yv[j]-yv[j+1])*(zv[k]-zv[k+1])))*(B_y1[i,j,k]*xv[i+1]*zv[k+1]-B_y1[i,j,k+1]*xv[i+1]*zv[k]-B_y1[i,j+1,k]*xv[i+1]*zv[k+1]+B_y1[i,j+1,k+1]*xv[i+1]*zv[k]-B_y1[i+1,j,k]*xv[i]*zv[k+1]+B_y1[i+1,j,k+1]*xv[i]*zv[k]+B_y1[i+1,j+1,k]*xv[i]*zv[k+1]-B_y1[i+1,j+1,k+1]*xv[i]*zv[k])
+            dy = (1/((xv[i]-xv[i+1])*(yv[j]-yv[j+1])*(zv[k]-zv[k+1])))*(-B_y1[i,j,k]*zv[k+1]+B_y1[i,j,k+1]*zv[k]+B_y1[i,j+1,k]*zv[k+1]-B_y1[i,j+1,k+1]*zv[k]+B_y1[i+1,j,k]*zv[k+1]-B_y1[i+1,j,k+1]*zv[k]-B_y1[i+1,j+1,k]*zv[k+1]+B_y1[i+1,j+1,k+1]*zv[k])
+            ey = (1/((xv[i]-xv[i+1])*(yv[j]-yv[j+1])*(zv[k]-zv[k+1])))*(B_y1[i,j,k]*xv[i+1]*yv[j+1]-B_y1[i,j,k+1]*xv[i+1]*yv[j+1]-B_y1[i,j+1,k]*xv[i+1]*yv[j]+B_y1[i,j+1,k+1]*xv[i+1]*yv[j]-B_y1[i+1,j,k]*xv[i]*yv[j+1]+B_y1[i+1,j,k+1]*xv[i]*yv[j+1]+B_y1[i+1,j+1,k]*xv[i]*yv[j]-B_y1[i+1,j+1,k+1]*xv[i]*yv[j])
+            fy = (1/((xv[i]-xv[i+1])*(yv[j]-yv[j+1])*(zv[k]-zv[k+1])))*(-B_y1[i,j,k]*yv[j+1]+B_y1[i,j,k+1]*yv[j+1]+B_y1[i,j+1,k]*yv[j]-B_y1[i,j+1,k+1]*yv[j]+B_y1[i+1,j,k]*yv[j+1]-B_y1[i+1,j,k+1]*yv[j+1]-B_y1[i+1,j+1,k]*yv[j]+B_y1[i+1,j+1,k+1]*yv[j])
+            gy = (1/((xv[i]-xv[i+1])*(yv[j]-yv[j+1])*(zv[k]-zv[k+1])))*(-B_y1[i,j,k]*xv[i+1]+B_y1[i,j,k+1]*xv[i+1]+B_y1[i,j+1,k]*xv[i+1]-B_y1[i,j+1,k+1]*xv[i+1]+B_y1[i+1,j,k]*xv[i]-B_y1[i+1,j,k+1]*xv[i]-B_y1[i+1,j+1,k]*xv[i]+B_y1[i+1,j+1,k+1]*xv[i])
+            hy = (1/((xv[i]-xv[i+1])*(yv[j]-yv[j+1])*(zv[k]-zv[k+1])))*(B_y1[i,j,k]-B_y1[i,j,k+1]-B_y1[i,j+1,k]+B_y1[i,j+1,k+1]-B_y1[i+1,j,k]+B_y1[i+1,j,k+1]+B_y1[i+1,j+1,k]-B_y1[i+1,j+1,k+1])
+
+
+            az = (1/((xv[i]-xv[i+1])*(yv[j]-yv[j+1])*(zv[k]-zv[k+1])))*(B_z1[i,j,k+1]*xv[i+1]*yv[j+1]*zv[k]+B_z1[i,j+1,k]*xv[i+1]*yv[j]*zv[k+1]+B_z1[i+1,j,k]*xv[i]*yv[j+1]*zv[k+1]+B_z1[i+1,j+1,k+1]*xv[i]*yv[j]*zv[k]-B_z1[i,j,k]*xv[i+1]*yv[j+1]*zv[k+1]-B_z1[i,j+1,k+1]*xv[i+1]*yv[j]*zv[k]-B_z1[i+1,j,k+1]*xv[i]*yv[j+1]*zv[k]-B_z1[i+1,j+1,k]*xv[i]*yv[j]*zv[k+1])
+            bz = (1/((xv[i]-xv[i+1])*(yv[j]-yv[j+1])*(zv[k]-zv[k+1])))*(B_z1[i,j,k]*yv[j+1]*zv[k+1]-B_z1[i,j,k+1]*yv[j+1]*zv[k]-B_z1[i,j+1,k]*yv[j]*zv[k+1]+B_z1[i,j+1,k+1]*yv[j]*zv[k]-B_z1[i+1,j,k]*yv[j+1]*zv[k+1]+B_z1[i+1,j,k+1]*yv[j+1]*zv[k]+B_z1[i+1,j+1,k]*yv[j]*zv[k+1]-B_z1[i+1,j+1,k+1]*yv[j]*zv[k])
+            cz = (1/((xv[i]-xv[i+1])*(yv[j]-yv[j+1])*(zv[k]-zv[k+1])))*(B_z1[i,j,k]*xv[i+1]*zv[k+1]-B_z1[i,j,k+1]*xv[i+1]*zv[k]-B_z1[i,j+1,k]*xv[i+1]*zv[k+1]+B_z1[i,j+1,k+1]*xv[i+1]*zv[k]-B_z1[i+1,j,k]*xv[i]*zv[k+1]+B_z1[i+1,j,k+1]*xv[i]*zv[k]+B_z1[i+1,j+1,k]*xv[i]*zv[k+1]-B_z1[i+1,j+1,k+1]*xv[i]*zv[k])
+            dz = (1/((xv[i]-xv[i+1])*(yv[j]-yv[j+1])*(zv[k]-zv[k+1])))*(-B_z1[i,j,k]*zv[k+1]+B_z1[i,j,k+1]*zv[k]+B_z1[i,j+1,k]*zv[k+1]-B_z1[i,j+1,k+1]*zv[k]+B_z1[i+1,j,k]*zv[k+1]-B_z1[i+1,j,k+1]*zv[k]-B_z1[i+1,j+1,k]*zv[k+1]+B_z1[i+1,j+1,k+1]*zv[k])
+            ez = (1/((xv[i]-xv[i+1])*(yv[j]-yv[j+1])*(zv[k]-zv[k+1])))*(B_z1[i,j,k]*xv[i+1]*yv[j+1]-B_z1[i,j,k+1]*xv[i+1]*yv[j+1]-B_z1[i,j+1,k]*xv[i+1]*yv[j]+B_z1[i,j+1,k+1]*xv[i+1]*yv[j]-B_z1[i+1,j,k]*xv[i]*yv[j+1]+B_z1[i+1,j,k+1]*xv[i]*yv[j+1]+B_z1[i+1,j+1,k]*xv[i]*yv[j]-B_z1[i+1,j+1,k+1]*xv[i]*yv[j])
+            fz = (1/((xv[i]-xv[i+1])*(yv[j]-yv[j+1])*(zv[k]-zv[k+1])))*(-B_z1[i,j,k]*yv[j+1]+B_z1[i,j,k+1]*yv[j+1]+B_z1[i,j+1,k]*yv[j]-B_z1[i,j+1,k+1]*yv[j]+B_z1[i+1,j,k]*yv[j+1]-B_z1[i+1,j,k+1]*yv[j+1]-B_z1[i+1,j+1,k]*yv[j]+B_z1[i+1,j+1,k+1]*yv[j])
+            gz = (1/((xv[i]-xv[i+1])*(yv[j]-yv[j+1])*(zv[k]-zv[k+1])))*(-B_z1[i,j,k]*xv[i+1]+B_z1[i,j,k+1]*xv[i+1]+B_z1[i,j+1,k]*xv[i+1]-B_z1[i,j+1,k+1]*xv[i+1]+B_z1[i+1,j,k]*xv[i]-B_z1[i+1,j,k+1]*xv[i]-B_z1[i+1,j+1,k]*xv[i]+B_z1[i+1,j+1,k+1]*xv[i])
+            hz = (1/((xv[i]-xv[i+1])*(yv[j]-yv[j+1])*(zv[k]-zv[k+1])))*(B_z1[i,j,k]-B_z1[i,j,k+1]-B_z1[i,j+1,k]+B_z1[i,j+1,k+1]-B_z1[i+1,j,k]+B_z1[i+1,j,k+1]+B_z1[i+1,j+1,k]-B_z1[i+1,j+1,k+1])
+
+
+            trilinear = np.array([[ax,bx,cx,dx,ex,fx,gx,hx],[ay,by,cy,dy,ey,fy,gy,hy],[az,bz,cz,dz,ez,fz,gz,hz]])
+
+            # creating three lists that store the sign of each field component on the faces of the cube
+            # the sign is appended only if the location given by the bilinear interpolation is on the face that is being considered
+            bzz = []
+            bxx = []
+            byy = []
+
+
+            # FACE 1
+
+            face1 = xv[i]
+
+            # bx = 0 and by = 0
+            # get bilinear coefficients
+            bxby = x_face(face1,trilinear[0],trilinear[1])
+            # solve quadratic equation to find 2 values for x
+            a = bxby[0,1]*bxby[1,3]-bxby[1,1]*bxby[0,3]
+            b = bxby[0,0]*bxby[1,3]-bxby[1,0]*bxby[0,3]+bxby[0,1]*bxby[1,2]-bxby[1,1]*bxby[0,2]
+            c = bxby[0,0]*bxby[1,2]-bxby[1,0]*bxby[0,2]
+            if (b*b-4*a*c) > 0 and a!=0:
+                y_roots = quad_roots(bxby)
+            # finding corresponding y values for those x that lie on the face
+            # using first x root
+                if yv[j]<=y_roots[0]<=yv[j+1]:
+                    foo = (bxby[0,0]+bxby[0,1]*y_roots[0])
+                    bar = (bxby[0,2]+bxby[0,3]*y_roots[0])
+                    if bar != 0:
+                        z1 = -foo/bar
+                        if zv[k]<=z1<=zv[k+1]:
+                            # substituting x and y values into bx expression to derive the corresponding z values
+                            bz1 = az + bz*face1 + y_roots[0]*(cz + dz*face1) + z1*(ez + fz*face1) + y_roots[0]*z1*(gz + hz*face1) 
+                            bzz.append(np.sign(bz1))
+                # using second x root
+                elif yv[j]<=y_roots[1]<=yv[j+1]:  
+                    foo = (bxby[1,0]+bxby[1,1]*y_roots[1])
+                    bar = (bxby[1,2]+bxby[1,3]*y_roots[1])
+                    if bar != 0:
+                        z2 = -foo/bar
+                        if zv[k]<=z2<=zv[k+1]:
+                            bz2 = az + bz*face1 + y_roots[1]*(cz + dz*face1) + z2*(ez + fz*face1) + y_roots[1]*z2*(gz + hz*face1) 
+                            bzz.append(np.sign(bz2))
+
+            # by = 0 and bz = 0
+            bybz = x_face(face1,trilinear[1],trilinear[2])
+            a = bybz[0,1]*bybz[1,3]-bybz[1,1]*bybz[0,3]
+            b = bybz[0,0]*bybz[1,3]-bybz[1,0]*bybz[0,3]+bybz[0,1]*bybz[1,2]-bybz[1,1]*bybz[0,2]
+            c = bybz[0,0]*bybz[1,2]-bybz[1,0]*bybz[0,2]
+            if (b*b-4*a*c) > 0 and a!=0:
+                y_roots = quad_roots(bybz)
+            # finding corresponding z values for those y that lie on the face
+            # using first y root
+                if yv[j]<=y_roots[0]<=yv[j+1]:
+                    foo = (bybz[0,0]+bybz[0,1]*y_roots[0])
+                    bar = (bybz[0,2]+bybz[0,3]*y_roots[0])
+                    if bar != 0:
+                        z1 = -foo/bar
+                        if zv[k]<=z1<=zv[k+1]:
+                            bx1 = ax + bx*face1 + cx*y_roots[0] + dx*face1*y_roots[0] + ex*z1 + fx*face1*z1 + gx*y_roots[0]*z1 + hz*face1*y_roots[0]*z1
+                            bxx.append(np.sign(bx1))
+                # using second y root
+                elif yv[j]<=y_roots[1]<=yv[j+1]:
+                    foo = (bybz[0,0]+bybz[0,1]*y_roots[1])
+                    bar = (bybz[0,2]+bybz[0,3]*y_roots[1])
+                    if bar != 0:   
+                        z2 = -foo/bar
+                        if zv[k]<=z2<=zv[k+1]:
+                            bx2 = ax + bx*face1 + cx*y_roots[1] + dx*face1*y_roots[1] + ex*z2 + fx*face1*z2 + gx*y_roots[1]*z2 + hz*face1*y_roots[1]*z2
+                            bxx.append(np.sign(bx2))
+
+            # bx = 0 and bz = 0
+            bxbz = x_face(face1,trilinear[0],trilinear[2])
+            a = bxbz[0,1]*bxbz[1,3]-bxbz[1,1]*bxbz[0,3]
+            b = bxbz[0,0]*bxbz[1,3]-bxbz[1,0]*bxbz[0,3]+bxbz[0,1]*bxbz[1,2]-bxbz[1,1]*bxbz[0,2]
+            c = bxbz[0,0]*bxbz[1,2]-bxbz[1,0]*bxbz[0,2]
+            if (b*b-4*a*c) > 0 and a!=0:
+                y_roots = quad_roots(bxbz)
+            # finding corresponding z values for those x that lie on the face
+            # using first x root
+                if yv[j]<=y_roots[0]<=yv[j+1]:
+                    foo = (bxbz[0,0]+bxbz[0,1]*y_roots[0])
+                    bar = (bxbz[0,2]+bxbz[0,3]*y_roots[0])
+                    if bar != 0:
+                        z1 = -foo/bar
+                        if zv[k]<=z1<=zv[k+1]:
+                            # substituting x and z values into bx expression to derive the corresponding y values
+                            by1 = ay + by*face1 + cy*y_roots[0] + dy*face1*y_roots[0] + ey*z1 + fy*face1*z1 + gy*y_roots[0]*z1 + hy*face1*y_roots[0]*z1
+                            byy.append(np.sign(by1))
+                # using second x root
+                elif yv[j]<=y_roots[1]<=yv[j+1]:
+                    foo = (bxbz[0,0]+bxbz[0,1]*y_roots[1])
+                    bar = (bxbz[0,2]+bxbz[0,3]*y_roots[1])
+                    if bar != 0:
+                        z2 = -foo/bar
+                        if zv[k]<=z2<=zv[k+1]:
+                            by2 = ay + by*face1 + cy*y_roots[1] + dy*face1*y_roots[1] + ey*z2 + fy*face1*z2 + gy*y_roots[1]*z2 + hy*face1*y_roots[1]*z2
+                            byy.append(np.sign(by2))
+
+
+            # FACE 2
+
+            face2 = xv[i+1]
+
+            # bx = 0 and by = 0
+            # get bilinear coefficients
+            bxby = x_face(face2,trilinear[0],trilinear[1])
+            # solve quadratic equation to find 2 values for y
+            a = bxby[0,1]*bxby[1,3]-bxby[1,1]*bxby[0,3]
+            b = bxby[0,0]*bxby[1,3]-bxby[1,0]*bxby[0,3]+bxby[0,1]*bxby[1,2]-bxby[1,1]*bxby[0,2]
+            c = bxby[0,0]*bxby[1,2]-bxby[1,0]*bxby[0,2]
+            if (b*b-4*a*c) > 0 and a!=0:
+                y_roots = quad_roots(bxby)
+            # finding corresponding y values for those x that lie on the face
+            # using first x root
+                if yv[j]<=y_roots[0]<=yv[j+1]:
+                    foo = (bxby[0,0]+bxby[0,1]*y_roots[0])
+                    bar = (bxby[0,2]+bxby[0,3]*y_roots[0])
+                    if bar != 0:
+                        z1 = -foo/bar
+                        if zv[k]<=z1<=zv[k+1]:
+                            # substituting x and y values into bx expression to derive the corresponding z values
+                            bz1 = az + bz*face2 + y_roots[0]*(cz + dz*face2) + z1*(ez + fz*face2) + y_roots[0]*z1*(gz + hz*face2) 
+                            bzz.append(np.sign(bz1))
+                # using second x root
+                elif yv[j]<=y_roots[1]<=yv[j+1]: 
+                    foo = (bxby[1,0]+bxby[1,1]*y_roots[1])
+                    bar = (bxby[1,2]+bxby[1,3]*y_roots[1])
+                    if bar != 0:
+                        z2 = -foo/bar
+                        if zv[k]<=z2<=zv[k+1]:
+                            bz2 = az + bz*face2 + y_roots[1]*(cz + dz*face2) + z2*(ez + fz*face2) + y_roots[1]*z2*(gz + hz*face2) 
+                            bzz.append(np.sign(bz2))
+
+            # by = 0 and bz = 0
+            bybz = x_face(face2,trilinear[1],trilinear[2])
+            a = bybz[0,1]*bybz[1,3]-bybz[1,1]*bybz[0,3]
+            b = bybz[0,0]*bybz[1,3]-bybz[1,0]*bybz[0,3]+bybz[0,1]*bybz[1,2]-bybz[1,1]*bybz[0,2]
+            c = bybz[0,0]*bybz[1,2]-bybz[1,0]*bybz[0,2]
+            if (b*b-4*a*c) > 0 and a !=0:
+                y_roots = quad_roots(bybz)
+            # finding corresponding z values for those y that lie on the face
+            # using first y root
+                if yv[j]<=y_roots[0]<=yv[j+1]:
+                    foo = (bybz[0,0]+bybz[0,1]*y_roots[0])
+                    bar = (bybz[0,2]+bybz[0,3]*y_roots[0])
+                    if bar != 0:
+                        z1 = -foo/bar
+                        if zv[k]<=z1<=zv[k+1]:
+                            bx1 = ax + bx*face2 + cx*y_roots[0] + dx*face2*y_roots[0] + ex*z1 + fx*face2*z1 + gx*y_roots[0]*z1 + hz*face2*y_roots[0]*z1
+                            bxx.append(np.sign(bx1))
+                # using second y root
+                elif yv[j]<=y_roots[1]<=yv[j+1]:
+                    foo = (bybz[0,0]+bybz[0,1]*y_roots[1])
+                    bar = (bybz[0,2]+bybz[0,3]*y_roots[1])
+                    if bar != 0:
+                        z2 = -foo/bar
+                        if zv[k]<=z2<=zv[k+1]:
+                            bx2 = ax + bx*face2 + cx*y_roots[1] + dx*face2*y_roots[1] + ex*z2 + fx*face2*z2 + gx*y_roots[1]*z2 + hz*face2*y_roots[1]*z2
+                            bxx.append(np.sign(bx2))
+
+            # bx = 0 and bz = 0
+            bxbz = x_face(face2,trilinear[0],trilinear[2])
+            a = bxbz[0,1]*bxbz[1,3]-bxbz[1,1]*bxbz[0,3]
+            b = bxbz[0,0]*bxbz[1,3]-bxbz[1,0]*bxbz[0,3]+bxbz[0,1]*bxbz[1,2]-bxbz[1,1]*bxbz[0,2]
+            c = bxbz[0,0]*bxbz[1,2]-bxbz[1,0]*bxbz[0,2]
+            if (b*b-4*a*c) > 0 and a!=0:
+                y_roots = quad_roots(bxbz)
+            # finding corresponding z values for those x that lie on the face
+            # using first x root
+                if yv[j]<=y_roots[0]<=yv[j+1]:
+                    foo = (bxbz[0,0]+bxbz[0,1]*y_roots[0])
+                    bar = (bxbz[0,2]+bxbz[0,3]*y_roots[0])
+                    if bar != 0:
+                        z1 = -foo/bar
+                        if zv[k]<=z1<=zv[k+1]:
+                            # substituting x and z values into bx expression to derive the corresponding y values
+                            by1 = ay + by*face2 + cy*y_roots[0] + dy*face2*y_roots[0] + ey*z1 + fy*face2*z1 + gy*y_roots[0]*z1 + hy*face2*y_roots[0]*z1
+                            byy.append(np.sign(by1))
+                # using second x root
+                elif yv[j]<=y_roots[1]<=yv[j+1]:
+                    foo = (bxbz[0,0]+bxbz[0,1]*y_roots[1])
+                    bar = (bxbz[0,2]+bxbz[0,3]*y_roots[1])
+                    if bar != 0:
+                        z2 = -foo/bar
+                        if zv[k]<=z2<=zv[k+1]:
+                            by2 = ay + by*face2 + cy*y_roots[1] + dy*face2*y_roots[1] + ey*z2 + fy*face2*z2 + gy*y_roots[1]*z2 + hy*face2*y_roots[1]*z2
+                            byy.append(np.sign(by2))
+
+
+
+            # FACE 3
+
+            face3 = yv[j]
+
+            # bx = 0 and by = 0
+            # get bilinear coefficients
+            bxby = y_face(face3,trilinear[0],trilinear[1])
+            # solve quadratic equation to find 2 values for x
+            a = bxby[0,1]*bxby[1,3]-bxby[1,1]*bxby[0,3]
+            b = bxby[0,0]*bxby[1,3]-bxby[1,0]*bxby[0,3]+bxby[0,1]*bxby[1,2]-bxby[1,1]*bxby[0,2]
+            c = bxby[0,0]*bxby[1,2]-bxby[1,0]*bxby[0,2]
+            if (b*b-4*a*c) > 0 and a!=0:
+                x_roots = quad_roots(bxby)
+            # finding corresponding y values for those x that lie on the face
+            # using first x root
+                if xv[i]<=x_roots[0]<=xv[i+1]:
+                    foo = (bxby[0,0]+bxby[0,1]*x_roots[0])
+                    bar = (bxby[0,2]+bxby[0,3]*x_roots[0])
+                    if bar != 0:
+                        z1 = -foo/bar
+                        if zv[k]<=z1<=zv[k+1]:
+                            bz1 = az + bz*x_roots[0] + cz*face3 + dz*x_roots[0]*face3 + ez*z1 + fz*x_roots[0]*z1 +gz*face3*z1 + hz*x_roots[0]*face3*z1
+                            bzz.append(np.sign(bz1))
+                # using second x root
+                elif xv[i]<=x_roots[1]<=xv[i+1]: 
+                    foo = (bxby[1,0]+bxby[1,1]*x_roots[1])
+                    bar = (bxby[1,2]+bxby[1,3]*x_roots[1])
+                    if bar != 0:
+                        z2 = -foo/bar
+                        if zv[k]<=z2<=zv[k+1]:
+                            bz2 = az + bz*x_roots[1] + cz*face3 + dz*x_roots[1]*face3 + ez*z2 + fz*x_roots[1]*z2 +gz*face3*z2 + hz*x_roots[1]*face3*z2
+                            bzz.append(np.sign(bz2))
+
+            # by = 0 and bz = 0
+            bybz = y_face(face3,trilinear[1],trilinear[2])
+            a = bybz[0,1]*bybz[1,3]-bybz[1,1]*bybz[0,3]
+            b = bybz[0,0]*bybz[1,3]-bybz[1,0]*bybz[0,3]+bybz[0,1]*bybz[1,2]-bybz[1,1]*bybz[0,2]
+            c = bybz[0,0]*bybz[1,2]-bybz[1,0]*bybz[0,2]
+            if (b*b-4*a*c) > 0 and a!=0:
+                x_roots = quad_roots(bybz)
+            # finding corresponding z values for those y that lie on the face
+                # using first y root
+                if xv[i]<=x_roots[0]<=xv[i+1]:
+                    foo = (bybz[0,0]+bybz[0,1]*x_roots[0])
+                    bar = (bybz[0,2]+bybz[0,3]*x_roots[0])
+                    if bar != 0:
+                        z1 = -foo/bar
+                        if zv[k]<=z1<=zv[k+1]:
+                            # substituting x and y values into by expression to derive the corresponding z values
+                            bx1 = ax + bx*x_roots[0] + cx*face3 + dx*x_roots[0]*face3 + ex*z1 + fx*x_roots[0]*z1 + gx*face3*z1 + hz*x_roots[0]*face3*z1
+                            bxx.append(np.sign(bx1))
+                # using second y root
+                elif xv[i]<=x_roots[1]<=xv[i+1]:
+                    foo = (bybz[0,0]+bybz[0,1]*x_roots[1])
+                    bar = (bybz[0,2]+bybz[0,3]*x_roots[1])
+                    if bar != 0:
+                        z2 = -foo/bar
+                        if zv[k]<=z2<=zv[k+1]:
+                            bx2 = ax + bx*x_roots[1] + cx*face3 + dx*x_roots[1]*face3 + ex*z2 + fx*x_roots[1]*z2 + gx*face3*z2 + hz*x_roots[1]*face3*z2
+                            bxx.append(np.sign(bx2))
+
+            # bx = 0 and bz = 0
+            bxbz = y_face(face3,trilinear[0],trilinear[2])
+            a = bxbz[0,1]*bxbz[1,3]-bxbz[1,1]*bxbz[0,3]
+            b = bxbz[0,0]*bxbz[1,3]-bxbz[1,0]*bxbz[0,3]+bxbz[0,1]*bxbz[1,2]-bxbz[1,1]*bxbz[0,2]
+            c = bxbz[0,0]*bxbz[1,2]-bxbz[1,0]*bxbz[0,2]
+            if (b*b-4*a*c) > 0 and a!=0:
+                x_roots = quad_roots(bxbz)
+            # finding corresponding z values for those x that lie on the face
+            # using first x root
+                if xv[i]<=x_roots[0]<=xv[i+1]:
+                    foo = (bxbz[0,0]+bxbz[0,1]*x_roots[0])
+                    bar = (bxbz[0,2]+bxbz[0,3]*x_roots[0])
+                    if bar != 0:
+                        z1 = -foo/bar
+                        if zv[k]<=z1<=zv[k+1]:
+                            by1 = ay + by*x_roots[0] + cy*face3 + dy*x_roots[0]*face3 + ey*z1 + fy*x_roots[0]*z1 + gy*face3*z1 + hy*x_roots[0]*face3*z1
+                            byy.append(np.sign(by1))
+                # using second x root
+                elif xv[i]<=x_roots[1]<=xv[i+1]:
+                    foo = (bxbz[0,0]+bxbz[0,1]*x_roots[1])
+                    bar = (bxbz[0,2]+bxbz[0,3]*x_roots[1])
+                    if bar != 0:
+                        z2 = -foo/bar
+                        if zv[k]<=z2<=zv[k+1]:
+                            by2 = ay + by*x_roots[1] + cy*face3 + dy*x_roots[1]*face3 + ey*z2 + fy*x_roots[1]*z2 + gy*face3*z2 + hy*x_roots[1]*face3*z2
+                            byy.append(np.sign(by2))
+
+
+            # FACE 4
+
+            face4 = yv[j+1]
+
+
+            # bx = 0 and by = 0
+            # get bilinear coefficients
+            bxby = y_face(face4,trilinear[0],trilinear[1])
+            # solve quadratic equation to find 2 values for x
+            a = bxby[0,1]*bxby[1,3]-bxby[1,1]*bxby[0,3]
+            b = bxby[0,0]*bxby[1,3]-bxby[1,0]*bxby[0,3]+bxby[0,1]*bxby[1,2]-bxby[1,1]*bxby[0,2]
+            c = bxby[0,0]*bxby[1,2]-bxby[1,0]*bxby[0,2]
+            if (b*b-4*a*c) > 0 and a!=0:
+                x_roots = quad_roots(bxby)
+            # finding corresponding y values for those x that lie on the face
+            # using first x root
+                if xv[i]<=x_roots[0]<=xv[i+1]:
+                    foo = (bxby[0,0]+bxby[0,1]*x_roots[0])
+                    bar = (bxby[0,2]+bxby[0,3]*x_roots[0])
+                    if bar != 0:
+                        z1 = -foo/bar
+                        if zv[k]<=z1<=zv[k+1]:
+                            bz1 = az + bz*x_roots[0] + cz*face4 + dz*x_roots[0]*face4 + ez*z1 + fz*x_roots[0]*z1 +gz*face4*z1 + hz*x_roots[0]*face4*z1
+                            bzz.append(np.sign(bz1))
+                # using second x root
+                elif xv[i]<=x_roots[1]<=xv[i+1]: 
+                    foo = (bxby[1,0]+bxby[1,1]*x_roots[1])
+                    bar = (bxby[1,2]+bxby[1,3]*x_roots[1])
+                    if bar != 0:
+                        z2 = -foo/bar
+                        if zv[k]<=z2<=zv[k+1]:
+                            bz2 = az + bz*x_roots[1] + cz*face4 + dz*x_roots[1]*face4 + ez*z2 + fz*x_roots[1]*z2 +gz*face4*z2 + hz*x_roots[1]*face4*z2
+                            bzz.append(np.sign(bz2))
+
+            # by = 0 and bz = 0
+            bybz = y_face(face4,trilinear[1],trilinear[2])
+            a = bybz[0,1]*bybz[1,3]-bybz[1,1]*bybz[0,3]
+            b = bybz[0,0]*bybz[1,3]-bybz[1,0]*bybz[0,3]+bybz[0,1]*bybz[1,2]-bybz[1,1]*bybz[0,2]
+            c = bybz[0,0]*bybz[1,2]-bybz[1,0]*bybz[0,2]
+            if (b*b-4*a*c) > 0 and a!=0:
+                x_roots = quad_roots(bybz)
+            # finding corresponding z values for those y that lie on the face
+            # using first y root
+                if xv[i]<=x_roots[0]<=xv[i+1]:
+                    foo = (bybz[0,0]+bybz[0,1]*x_roots[0])
+                    bar = (bybz[0,2]+bybz[0,3]*x_roots[0])
+                    if bar != 0:
+                        z1 = -foo/bar
+                        if zv[k]<=z1<=zv[k+1]:
+                            # substituting x and y values into by expression to derive the corresponding z values
+                            bx1 = ax + bx*x_roots[0] + cx*face4 + dx*x_roots[0]*face4 + ex*z1 + fx*x_roots[0]*z1 + gx*face4*z1 + hz*x_roots[0]*face4*z1
+                            bxx.append(np.sign(bx1))
+                # using second y root
+                elif xv[i]<=x_roots[1]<=xv[i+1]:
+                    foo = (bybz[0,0]+bybz[0,1]*x_roots[1])
+                    bar = (bybz[0,2]+bybz[0,3]*x_roots[1])
+                    if bar != 0:
+                        z2 = -foo/bar
+                        if zv[k]<=z2<=zv[k+1]:
+                            bx2 = ax + bx*x_roots[1] + cx*face4 + dx*x_roots[1]*face4 + ex*z2 + fx*x_roots[1]*z2 + gx*face4*z2 + hz*x_roots[1]*face4*z2
+                            bxx.append(np.sign(bx2))
+
+            # bx = 0 and bz = 0
+            bxbz = y_face(face4,trilinear[0],trilinear[2])
+            a = bxbz[0,1]*bxbz[1,3]-bxbz[1,1]*bxbz[0,3]
+            b = bxbz[0,0]*bxbz[1,3]-bxbz[1,0]*bxbz[0,3]+bxbz[0,1]*bxbz[1,2]-bxbz[1,1]*bxbz[0,2]
+            c = bxbz[0,0]*bxbz[1,2]-bxbz[1,0]*bxbz[0,2]
+            if (b*b-4*a*c) > 0 and a!=0:
+                x_roots = quad_roots(bxbz)
+            # finding corresponding z values for those x that lie on the face
+            # using first x root
+                if xv[i]<=x_roots[0]<=xv[i+1]:
+                    foo = (bxbz[0,0]+bxbz[0,1]*x_roots[0])
+                    bar = (bxbz[0,2]+bxbz[0,3]*x_roots[0])
+                    if bar != 0:
+                        z1 = -foo/bar
+                        if zv[k]<=z1<=zv[k+1]:
+                            by1 = ay + by*x_roots[0] + cy*face4 + dy*x_roots[0]*face4 + ey*z1 + fy*x_roots[0]*z1 + gy*face4*z1 + hy*x_roots[0]*face4*z1
+                            byy.append(np.sign(by1))
+                # using second x root
+                elif xv[i]<=x_roots[1]<=xv[i+1]:
+                    foo = (bxbz[0,0]+bxbz[0,1]*x_roots[1])
+                    bar = (bxbz[0,2]+bxbz[0,3]*x_roots[1])
+                    if bar != 0:
+                        z2 = -foo/bar
+                        if zv[k]<=z2<=zv[k+1]:
+                            by2 = ay + by*x_roots[1] + cy*face4 + dy*x_roots[1]*face4 + ey*z2 + fy*x_roots[1]*z2 + gy*face4*z2 + hy*x_roots[1]*face4*z2
+                            byy.append(np.sign(by2))
+
+
+            # FACE 5
+
+            face5 = zv[k]
+
+            # bx = 0 and by = 0
+            # get bilinear coefficients
+            bxby = z_face(face5,trilinear[0],trilinear[1])
+            # solve quadratic equation to find 2 values for x
+            a = bxby[0,1]*bxby[1,3]-bxby[1,1]*bxby[0,3]
+            b = bxby[0,0]*bxby[1,3]-bxby[1,0]*bxby[0,3]+bxby[0,1]*bxby[1,2]-bxby[1,1]*bxby[0,2]
+            c = bxby[0,0]*bxby[1,2]-bxby[1,0]*bxby[0,2]
+            if (b*b-4*a*c) > 0 and a!=0:
+                x_roots = quad_roots(bxby)
+            # finding corresponding y values for those x that lie on the face
+            # using first x root
+                if xv[i]<=x_roots[0]<=xv[i+1]:
+                    foo = (bxby[0,0]+bxby[0,1]*x_roots[0])
+                    bar = (bxby[0,2]+bxby[0,3]*x_roots[0])
+                    if bar != 0:
+                        y1 = -foo/bar
+                        if yv[j]<=y1<=yv[j+1]:
+                            # substituting x and y values into bx expression to derive the corresponding z values
+                            bz1 = az + bz*x_roots[0] + cz*y1 + dz*x_roots[0]*y1 + ez*face5 + fz*x_roots[0]*face5 +gz*y1*face5 + hz*x_roots[0]*y1*face5
+                            bzz.append(np.sign(bz1))
+                # using second x root
+                elif xv[i]<=x_roots[1]<=xv[i+1]:   
+                    foo = (bxby[1,0]+bxby[1,1]*x_roots[1])
+                    bar = (bxby[1,2]+bxby[1,3]*x_roots[1])
+                    if bar != 0:
+                        y2 = -foo/bar
+                        if yv[j]<=y2<=yv[j+1]:
+                            bz2 = az + bz*x_roots[1] + cz*y2 + dz*x_roots[1]*y2 + ez*face5 + fz*x_roots[1]*face5 +gz*y2*face5 + hz*x_roots[1]*y2*face5
+                            bzz.append(np.sign(bz2))
+
+            # by = 0 and bz = 0
+            bybz = z_face(face5,trilinear[1],trilinear[2])
+            a = bybz[0,1]*bybz[1,3]-bybz[1,1]*bybz[0,3]
+            b = bybz[0,0]*bybz[1,3]-bybz[1,0]*bybz[0,3]+bybz[0,1]*bybz[1,2]-bybz[1,1]*bybz[0,2]
+            c = bybz[0,0]*bybz[1,2]-bybz[1,0]*bybz[0,2]
+            if (b*b-4*a*c) > 0 and a!=0:
+                x_roots = quad_roots(bybz)
+            # finding corresponding z values for those y that lie on the face
+            # using first y root
+                if xv[i]<=x_roots[0]<=xv[i+1]:
+                    foo = (bybz[0,0]+bybz[0,1]*x_roots[0])
+                    bar = (bybz[0,2]+bybz[0,3]*x_roots[0])
+                    if bar != 0:
+                        y1 = -foo/bar
+                        if yv[j]<=y1<=yv[j+1]:
+                            bx1 = ax + bx*x_roots[0] + cx*y1 + dx*x_roots[0]*y1 + ex*face5 + fx*x_roots[0]*face5 + gx*y1*face5 + hz*x_roots[0]*y1*face5
+                            bxx.append(np.sign(bx1))
+                # using second y root
+                elif xv[i]<=x_roots[1]<=xv[i+1]:
+                    foo = (bybz[0,0]+bybz[0,1]*x_roots[1])
+                    bar = (bybz[0,2]+bybz[0,3]*x_roots[1])
+                    if bar != 0:
+                        y2 = -foo/bar
+                        if yv[j]<=y2<=yv[j+1]:
+                            bx2 = ax + bx*x_roots[1] + cx*y2 + dx*x_roots[1]*y2 + ex*face5 + fx*x_roots[1]*face5 + gx*y2*face5 + hz*x_roots[1]*y2*face5
+                            bxx.append(np.sign(bx2))
+
+            # bx = 0 and bz = 0
+            bxbz = z_face(face5,trilinear[0],trilinear[2])
+            a = bxbz[0,1]*bxbz[1,3]-bxbz[1,1]*bxbz[0,3]
+            b = bxbz[0,0]*bxbz[1,3]-bxbz[1,0]*bxbz[0,3]+bxbz[0,1]*bxbz[1,2]-bxbz[1,1]*bxbz[0,2]
+            c = bxbz[0,0]*bxbz[1,2]-bxbz[1,0]*bxbz[0,2]
+            if (b*b-4*a*c) > 0 and a!=0:
+                x_roots = quad_roots(bxbz)
+            # finding corresponding z values for those x that lie on the face
+            # using first x root
+                if xv[i]<=x_roots[0]<=xv[i+1]:
+                    foo = (bxbz[0,0]+bxbz[0,1]*x_roots[0])
+                    bar = (bxbz[0,2]+bxbz[0,3]*x_roots[0])
+                    if bar != 0:
+                        y1 = -foo/bar
+                        if yv[j]<=y1<=yv[j+1]:
+                            by1 = ay + by*x_roots[0] + cy*y1 + dy*x_roots[0]*y1 + ey*face5 + fy*x_roots[0]*face5 + gy*y1*face5 + hy*x_roots[0]*y1*face5
+                            byy.append(np.sign(by1))
+                # using second x root
+                elif xv[i]<=x_roots[1]<=xv[i+1]:
+                    foo = (bxbz[0,0]+bxbz[0,1]*x_roots[1])
+                    bar = (bxbz[0,2]+bxbz[0,3]*x_roots[1])
+                    if bar != 0:
+                        y2 = -foo/bar
+                        if yv[j]<=y2<=yv[j+1]:
+                            by2 = ay + by*x_roots[1] + cy*y2 + dy*x_roots[1]*y2 + ey*face5 + fy*x_roots[1]*face5 + gy*y2*face5 + hy*x_roots[1]*y2*face5
+                            byy.append(np.sign(by2))
+
+
+            # FACE 6
+
+            face6 = zv[k+1]
+
+            # bx = 0 and by = 0
+            # get bilinear coefficients
+            bxby = z_face(face6,trilinear[0],trilinear[1])
+            # solve quadratic equation to find 2 values for x
+            a = bxby[0,1]*bxby[1,3]-bxby[1,1]*bxby[0,3]
+            b = bxby[0,0]*bxby[1,3]-bxby[1,0]*bxby[0,3]+bxby[0,1]*bxby[1,2]-bxby[1,1]*bxby[0,2]
+            c = bxby[0,0]*bxby[1,2]-bxby[1,0]*bxby[0,2]
+            if (b*b-4*a*c) > 0 and a!=0:
+                x_roots = quad_roots(bxby)
+            # finding corresponding y values for those x that lie on the face
+            # using first x root
+                if (xv[i]<=x_roots[0]<=xv[i+1]):
+                    #and np.min(np.absolute(bxby[0,:]))>0:
+                    foo = (bxby[0,0]+bxby[0,1]*x_roots[0])
+                    bar = (bxby[0,2]+bxby[0,3]*x_roots[0])
+                    if (bar != 0): 
+                        y1 = -foo/bar
+                        if yv[j]<=y1<=yv[j+1]:
+                        # substituting x and y values into bx expression to derive the corresponding z values
+                            bz1 = az + bz*x_roots[0] + cz*y1 + dz*x_roots[0]*y1 + ez*face6 + fz*x_roots[0]*face6 +gz*y1*face6 + hz*x_roots[0]*y1*face6
+                            bzz.append(np.sign(bz1))
+                # using second x root
+                elif xv[i]<=x_roots[1]<=xv[i+1]:
+                    #and np.min(np.absolute(bxby[1,:]))>0: 
+                    foo = (bxby[1,0]+bxby[1,1]*x_roots[1])
+                    bar = (bxby[1,2]+bxby[1,3]*x_roots[1])
+                    if (bar != 0): 
+                        y2 = -foo/bar
+                        if yv[j]<=y2<=yv[j+1]:
+                            bz2 = az + bz*x_roots[1] + cz*y2 + dz*x_roots[1]*y2 + ez*face6 + fz*x_roots[1]*face6 +gz*y2*face6 + hz*x_roots[1]*y2*face6
+                            bzz.append(np.sign(bz2))
+
+            # by = 0 and bz = 0
+            bybz = z_face(face6,trilinear[1],trilinear[2])
+            a = bybz[0,1]*bybz[1,3]-bybz[1,1]*bybz[0,3]
+            b = bybz[0,0]*bybz[1,3]-bybz[1,0]*bybz[0,3]+bybz[0,1]*bybz[1,2]-bybz[1,1]*bybz[0,2]
+            c = bybz[0,0]*bybz[1,2]-bybz[1,0]*bybz[0,2]
+            if (b*b-4*a*c) > 0 and a!=0:
+                x_roots = quad_roots(bybz)
+            # finding corresponding z values for those y that lie on the face
+            # using first y root
+                if xv[i]<=x_roots[0]<=xv[i+1]:
+                    foo = (bybz[0,0]+bybz[0,1]*x_roots[0])
+                    bar = (bybz[0,2]+bybz[0,3]*x_roots[0])
+                    if bar != 0:
+                        y1 = -foo/bar
+                        if yv[j]<=y1<=yv[j+1]:
+                            bx1 = ax + bx*x_roots[0] + cx*y1 + dx*x_roots[0]*y1 + ex*face6 + fx*x_roots[0]*face6 + gx*y1*face6 + hz*x_roots[0]*y1*face6
+                            bxx.append(np.sign(bx1))
+                # using second y root
+                elif xv[i]<=x_roots[1]<=xv[i+1]:
+                    foo = (bybz[0,0]+bybz[0,1]*x_roots[1])
+                    bar = (bybz[0,2]+bybz[0,3]*x_roots[1])
+                    if bar != 0:
+                        y2 = -foo/bar
+                        if yv[j]<=y2<=yv[j+1]:
+                            bx2 = ax + bx*x_roots[1] + cx*y2 + dx*x_roots[1]*y2 + ex*face6 + fx*x_roots[1]*face6 + gx*y2*face6 + hz*x_roots[1]*y2*face6
+                            bxx.append(np.sign(bx2))
+
+            # bx = 0 and bz = 0
+            bxbz = z_face(face6,trilinear[0],trilinear[2])
+            a = bxbz[0,1]*bxbz[1,3]-bxbz[1,1]*bxbz[0,3]
+            b = bxbz[0,0]*bxbz[1,3]-bxbz[1,0]*bxbz[0,3]+bxbz[0,1]*bxbz[1,2]-bxbz[1,1]*bxbz[0,2]
+            c = bxbz[0,0]*bxbz[1,2]-bxbz[1,0]*bxbz[0,2]
+            if (b*b-4*a*c) > 0 and a!=0:
+                x_roots = quad_roots(bxbz)
+            # finding corresponding z values for those x that lie on the face
+            # using first x root
+                if xv[i]<=x_roots[0]<=xv[i+1]:
+                    foo = (bxbz[0,0]+bxbz[0,1]*x_roots[0])
+                    bar = (bxbz[0,2]+bxbz[0,3]*x_roots[0])
+                    if bar != 0 :
+                        y1 = -foo/bar
+                        if yv[j]<=y1<=yv[j+1]:
+                            by1 = ay + by*x_roots[0] + cy*y1 + dy*x_roots[0]*y1 + ey*face6 + fy*x_roots[0]*face6 + gy*y1*face6 + hy*x_roots[0]*y1*face6
+                            byy.append(np.sign(by1))
+                # using second x root
+                elif xv[i]<=x_roots[1]<=xv[i+1]:
+                    foo = (bxbz[0,0]+bxbz[0,1]*x_roots[1])
+                    bar = (bxbz[0,2]+bxbz[0,3]*x_roots[1])
+                    if bar != 0:
+                        y2 = -foo/bar
+                        if yv[j]<=y2<=yv[j+1]:
+                            by2 = ay + by*x_roots[1] + cy*y2 + dy*x_roots[1]*y2 + ey*face6 + fy*x_roots[1]*face6 + gy*y2*face6 + hy*x_roots[1]*y2*face6
+                            byy.append(np.sign(by2))
+
+
+            # if the function check_sign detects a change in sign in at least one of the three field components, then a single null point must exist in the cell
+            # hence, apply Newton-Raphson method to find its location
+
+            #if (check_sign(bxx) is False) or (check_sign(byy) is False) or (check_sign(bzz) is False):
+            if not ( check_sign(bxx) and check_sign(byy) and check_sign(bzz) ):
+                #print('testing for null at ',i,j,k,'                 ')
+                #print(' -- bilear test identified possible null at ',i,j,k)
+                #print(' -- initiating Newton-Raphson method')
+                bilinear_pass +=1
+                # NEWTON RAPHSON METHOD
+
+                # first guess: centre of the cube 
+
+                xg = 0.5
+                yg = 0.5
+                zg = 0.5
+                xs = xv[i]+(xv[i+1]-xv[i])*xg
+                ys = yv[j]+(yv[j+1]-yv[j])*yg
+                zs = zv[k]+(zv[k+1]-zv[k])*zg
+
+                # grid size
+                delta_x = xv[i+1]-xv[i]
+                delta_y = yv[j+1]-yv[j]
+                delta_z = zv[k+1]-zv[k]
+                # values of solution
+                x = [0]
+                y = [0]
+                z = [0]
+                # step size
+                step_x = []
+                step_y = []
+                step_z = []
+                # error relative to the local grid size
+                err_rel_grid = []
+                # error relative to the solution
+                err_rel_sol = []
+
+                converged = False
+
+                # set a counter to limit the number of iterations 
+                n_steps = 0
+
+                while (not converged) and (n_steps < 11): 
+                    n_steps += 1
+                    # calculating B field magnitude and components at the guessed location
+                    B = B_field(xs,ys,zs,trilinear)
+
+                    jac = jacobian(xs,ys,zs,trilinear)
+
+                    if np.linalg.det(jac)==0:
+                        print('The matrix is singular')
+                        break
+
+
+                    else:
+
+
+                        jac_inv = inv(jacobian(xs,ys,zs,trilinear))
+
+                        xs_prev = xs
+                        ys_prev = ys
+                        zs_prev = zs
+
+                        xs = xs_prev-(jac_inv[0,0]*B[1]+jac_inv[0,1]*B[2]+jac_inv[0,2]*B[3])
+                        ys = ys_prev-(jac_inv[1,0]*B[1]+jac_inv[1,1]*B[2]+jac_inv[1,2]*B[3])
+                        zs = zs_prev-(jac_inv[2,0]*B[1]+jac_inv[2,1]*B[2]+jac_inv[2,2]*B[3])
+
+                        new_B = B_field(xs,ys,zs,trilinear)
+
+                        step_x.append(xs-xs_prev)
+                        step_y.append(ys-ys_prev)
+                        step_z.append(zs-zs_prev)
+
+                        x.append(xs_prev+step_x[-1])
+                        y.append(ys_prev+step_y[-1])
+                        z.append(zs_prev+step_z[-1])
+
+                        err_rel_grid.append(math.sqrt((step_x[-1]/delta_x)**2+(step_y[-1]/delta_y)**2+(step_z[-1]/delta_z)**2))
+                        err_rel_sol.append(math.sqrt((step_z[-1]/x[-1])**2+(step_y[-1]/y[-1])**2+(step_z[-1]/z[-1])**2))
+
+
+                        if np.max([err_rel_grid[-1], err_rel_sol[-1]]) < tolerance:
+                            converged = True
+
+                            B1 = math.sqrt(B_x1[i,j,k]**2 + B_y1[i,j,k]**2 + B_z1[i,j,k]**2)
+                            B2 = math.sqrt(B_x1[i+1,j,k]**2 + B_y1[i+1,j,k]**2 + B_z1[i+1,j,k]**2)
+                            B3 = math.sqrt(B_x1[i,j+1,k]**2 + B_y1[i,j+1,k]**2 + B_z1[i,j+1,k]**2)
+                            B4 = math.sqrt(B_x1[i+1,j+1,k]**2 + B_y1[i+1,j+1,k]**2 + B_z1[i+1,j+1,k]**2)
+                            B5 = math.sqrt(B_x1[i,j,k+1]**2 + B_y1[i,j,k+1]**2 + B_z1[i,j,k+1]**2)
+                            B6 = math.sqrt(B_x1[i+1,j,k+1]**2 + B_y1[i+1,j,k+1]**2 + B_z1[i+1,j,k+1]**2)
+                            B7 = math.sqrt(B_x1[i,j+1,k+1]**2 + B_y1[i,j+1,k+1]**2 + B_z1[i,j+1,k+1]**2)
+                            B8 = math.sqrt(B_x1[i+1,j+1,k+1]**2 + B_y1[i+1,j+1,k+1]**2 + B_z1[i+1,j+1,k+1]**2)
+
+                            if n_steps>100:
+                                print('Maximum number of steps exceeded -- exiting')
+
+                            if converged:
+                                if ((xv[i] < xs <= xv[i+1]) and (yv[j] < ys <= yv[j+1]) and (zv[k] < zs <= zv[k+1])):
+                                    if k < (nz-2): # this excludes the null points located on the null line that goes around the two outermost shells
+                                        #print('testing for null at ',i,j,k,'                 ')
+                                        print(' -- null found at x=',xs,', y=',ys,', z=',zs)
+                                        if new_B[0] < tolerance*np.mean([B1,B2,B3,B4,B5,B6,B7,B8]):
+                                            num_nulls+=1
+                                            # here if we want, we can also get the eigenvectors/eigenvalues
+                                            # use your previous function to get jacobian of magnetic field
+                                            # use numpy.linalg.eig to find eigen-stuff of jacobian
+                                            this_null = {'i':i, 'j':j, 'k':k, 'n': num_nulls, 'x': xs, 'y': ys, 'z': zs, 'B': new_B[0], 'Error' : np.array([err_rel_grid[-1], err_rel_sol[-1]]).max(), 'iter' : n_steps }
+                                            null_list.append(this_null)
+
+                                else: pass
+                                    #print('testing for null at ',i,j,k,'                 ')
+                                    #print(' -- null outside of box')        
+
+        
+    return(null_list)
